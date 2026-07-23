@@ -1,0 +1,1385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>B站视频 AI 总结 - prototype v4</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        boxShadow: {
+          'toast': '0 12px 32px -4px rgba(15, 23, 42, 0.20)',
+          'card': '0px 1px 2px 0px rgba(0, 0, 0, 0.05)',
+        },
+        borderRadius: { 'figma': '8px' }
+      }
+    }
+  };
+</script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+.status-completed { background: #d1fae5; color: #065f46; }
+.status-pending { background: #fef3c7; color: #92400e; }
+.status-extracting { background: #dbeafe; color: #1e40af; }
+.status-asr_recognizing { background: #e0e7ff; color: #3730a3; }
+.status-summarizing { background: #fce7f3; color: #9d174d; }
+.status-failed { background: #fee2e2; color: #991b1b; }
+@keyframes pulse-dot { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+.pulse-dot { animation: pulse-dot 2s infinite; }
+.toast-container { position:fixed; bottom:20px; right:20px; z-index:9999; display:flex; flex-direction:column; gap:8px; pointer-events:none; }
+.toast { padding:12px 18px; border-radius:10px; color:white; font-size:14px; box-shadow:0 12px 32px -4px rgba(15,23,42,0.20); transform:translateX(120%); transition:transform .3s; pointer-events:auto; display:flex; align-items:center; gap:10px; min-width:240px; }
+.toast.show { transform:translateX(0); }
+.toast-success { background:#10b981; }
+.toast-error { background:#ef4444; }
+.toast-info { background:#3b82f6; }
+.line-clamp-1 { display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
+.line-clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.summary-prose h1 { font-size:1.5rem; font-weight:700; margin:1rem 0 .5rem; color:#1e293b; }
+.summary-prose h2 { font-size:1.25rem; font-weight:700; margin:1rem 0 .5rem; color:#1e293b; }
+.summary-prose h3 { font-size:1.1rem; font-weight:600; margin:.875rem 0 .375rem; color:#334155; }
+.summary-prose p { margin:.5rem 0; line-height:1.75; }
+.summary-prose strong { color:#0f172a; font-weight:600; }
+.summary-prose ul, .summary-prose ol { margin:.5rem 0; padding-left:1.25rem; }
+.summary-prose ul { list-style:disc; }
+.summary-prose ol { list-style:decimal; }
+.summary-prose li { margin:.25rem 0; line-height:1.7; }
+.summary-prose blockquote { border-left:4px solid #f472b6; padding-left:1rem; margin:.75rem 0; color:#475569; background:#fdf2f8; border-radius:0 6px 6px 0; }
+.summary-prose code { background:#f1f5f9; padding:2px 6px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:.9em; }
+.summary-prose pre { background:#1e293b; color:#e2e8f0; padding:1rem; border-radius:8px; overflow-x:auto; margin:.75rem 0; }
+.summary-prose pre code { background:transparent; padding:0; color:inherit; }
+.summary-prose a { color:#ec4899; text-decoration:underline; }
+.summary-prose hr { border:none; border-top:1px solid #e2e8f0; margin:1rem 0; }
+.summary-prose table { width:100%; border-collapse:collapse; margin:.75rem 0; }
+.summary-prose th, .summary-prose td { border:1px solid #e2e8f0; padding:.5rem; text-align:left; }
+.summary-prose th { background:#f8fafc; font-weight:600; }
+.scrollable-panel { overflow-y:auto; }
+.scrollable-panel::-webkit-scrollbar { width:4px; }
+.scrollable-panel::-webkit-scrollbar-thumb { background:#e2e8f0; border-radius:2px; }
+.scrollable-panel::-webkit-scrollbar-thumb:hover { background:#cbd5e1; }
+</style>
+</head>
+<body class="bg-[#F8FAFC] text-slate-800 h-screen overflow-hidden">
+
+<div id="toastContainer" class="toast-container"></div>
+
+<script>
+function toggleMobileSidebar(){
+  const el=document.getElementById('sidebar');
+  if(!el) return;
+  el.classList.toggle('flex');
+  el.classList.toggle('hidden');
+}
+</script>
+
+<div class="flex h-full flex-col lg:flex-row">
+  <!-- ===== Mobile top bar ===== -->
+  <div class="lg:hidden flex items-center justify-between bg-white border-b border-slate-200 px-4 py-3 flex-shrink-0">
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 bg-pink-500 rounded-lg flex items-center justify-center text-white"><i class="fas fa-robot"></i></div>
+      <h1 class="font-bold text-base">AI 视频总结</h1>
+    </div>
+    <button onclick="toggleMobileSidebar()" class="p-2 rounded-lg hover:bg-slate-100 text-slate-600"><i class="fas fa-list"></i></button>
+  </div>
+
+  <!-- ===== Sidebar ===== -->
+  <aside id="sidebar" class="w-full lg:w-[320px] h-full bg-white border-r border-[#E2E8F0] flex-col flex-shrink-0 hidden lg:flex">
+    <div class="px-4 py-4 border-b border-[#F1F5F9]">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 bg-pink-500 rounded-lg flex items-center justify-center text-white shrink-0"><i class="fas fa-robot text-sm"></i></div>
+          <h1 class="font-bold text-lg">AI 视频总结</h1>
+        </div>
+        <div id="backendStatus" class="flex items-center gap-1.5 text-xs text-slate-500 pr-1" title="后端连接状态">
+          <span id="backendStatusDot" class="w-2 h-2 rounded-full bg-slate-300"></span>
+          <span id="backendStatusText">未连接</span>
+        </div>
+      </div>
+      <button onclick="openNewJobModal()" class="w-full bg-pink-500 hover:bg-pink-600 text-white py-2 px-4 rounded-lg font-medium flex items-center justify-center gap-2 text-sm">
+        <i class="fas fa-plus text-sm"></i> 新建任务
+      </button>
+    </div>
+    <div class="px-4 py-3 border-b border-[#F1F5F9] space-y-2">
+      <div class="relative">
+        <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
+        <input type="text" id="searchInput" placeholder="搜索标题 / UP主..." class="w-full pl-9 pr-9 py-[7px] bg-[#F1F5F9] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-pink-300" oninput="debouncedLoadJobs(); toggleSearchClear()">
+        <button id="searchClearBtn" onclick="clearSearch()" class="hidden absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1"><i class="fas fa-times-circle"></i></button>
+      </div>
+      <div class="flex gap-1">
+        <button onclick="setFilter('')" class="filter-btn flex-1 py-1 px-2 rounded text-xs font-medium bg-slate-800 text-white" data-status="">全部</button>
+        <button onclick="setFilter('summarizing')" class="filter-btn flex-1 py-1 px-2 rounded text-xs font-medium bg-[#F1F5F9] text-slate-600 hover:bg-slate-200" data-status="summarizing">处理中</button>
+        <button onclick="setFilter('completed')" class="filter-btn flex-1 py-1 px-2 rounded text-xs font-medium bg-[#F1F5F9] text-slate-600 hover:bg-slate-200" data-status="completed">完成</button>
+        <button onclick="setFilter('failed')" class="filter-btn flex-1 py-1 px-2 rounded text-xs font-medium bg-[#F1F5F9] text-slate-600 hover:bg-slate-200" data-status="failed">失败</button>
+      </div>
+    </div>
+    <div id="jobList" class="flex-1 overflow-y-auto p-2 space-y-0"></div>
+    <div class="px-3 py-3 border-t border-[#F1F5F9] text-xs text-slate-500 flex justify-between items-center">
+      <span id="statsTotal">共 0 个任务</span>
+      <div class="flex items-center gap-2">
+        <button onclick="fetchJobsFromApi(true)" class="px-2 py-1 rounded-md hover:bg-slate-100 hover:text-pink-500 flex items-center gap-1.5">
+          <i class="fas fa-sync-alt text-xs"></i> 刷新
+        </button>
+        <button onclick="openSettingsModal()" class="px-2 py-1 rounded-md hover:bg-slate-100 hover:text-pink-500 flex items-center gap-1.5">
+          <i class="fas fa-cog text-xs"></i> 设置
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ===== Main Detail ===== -->
+  <main class="flex-1 flex flex-col overflow-hidden relative bg-[#F8FAFC]">
+    <div id="emptyState" class="flex-1 flex flex-col items-center justify-center text-slate-400">
+      <i class="fas fa-inbox text-6xl mb-4 text-slate-200"></i>
+      <p class="text-lg">从左侧选择任务，或新建任务开始</p>
+    </div>
+
+    <div id="detailView" class="hidden flex-col h-full">
+      <!-- Header -->
+      <header class="bg-white border-b border-[#E2E8F0] px-6 py-4 flex-shrink-0">
+        <div class="flex items-center gap-4">
+          <div id="detailThumbnail" class="hidden w-16 h-16 rounded-lg overflow-hidden flex-shrink-0 border border-[#E2E8F0] bg-slate-100">
+            <img id="detailThumbnailImg" src="" alt="" class="w-full h-full object-cover">
+          </div>
+          <div class="flex-1 min-w-0">
+            <h1 id="detailTitle" class="text-lg font-bold text-slate-800 line-clamp-1 mb-1">标题</h1>
+            <div class="flex items-center gap-3 text-sm text-slate-500 flex-wrap pt-0.5">
+              <span id="detailUploader" class="flex items-center gap-1"><i class="fas fa-user-circle text-xs"></i> UP主</span>
+              <span class="w-1 h-1 rounded-full bg-slate-300"></span>
+              <span id="detailDuration" class="flex items-center gap-1"><i class="far fa-clock text-xs"></i> 时长</span>
+              <span class="w-1 h-1 rounded-full bg-slate-300"></span>
+              <span id="detailStatusBadge" class="px-2 py-0.5 rounded-md text-xs font-medium status-completed">状态</span>
+              <span id="detailCompletedHint" class="hidden text-xs text-green-600 flex items-center gap-1"><i class="fas fa-check-circle"></i> <span id="completedTime"></span></span>
+              <span id="progressInline" class="hidden flex items-center gap-1 ml-1">
+                <span class="inline-block w-[271px] max-w-full bg-[#F1F5F9] rounded-full h-2 overflow-hidden">
+                  <span id="progressBar" class="block bg-pink-500 h-full rounded-full transition-all duration-500" style="width:0%"></span>
+                </span>
+                <span id="progressPercent" class="text-xs font-medium text-pink-500">0%</span>
+              </span>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 flex-shrink-0">
+            <button onclick="copySummary()" class="w-10 h-10 bg-[#F1F5F9] rounded-lg flex items-center justify-center text-slate-600 hover:bg-slate-200" title="复制总结"><i class="fas fa-copy text-sm"></i></button>
+            <button onclick="copyMarkdown()" class="w-10 h-10 bg-[#F1F5F9] rounded-lg flex items-center justify-center text-slate-600 hover:bg-slate-200" title="复制 Markdown"><i class="fab fa-markdown text-sm"></i></button>
+            <div class="relative">
+              <button onclick="toggleMoreMenu(event)" id="btnMore" class="w-10 h-10 bg-[#F1F5F9] rounded-lg flex items-center justify-center text-slate-600 hover:bg-slate-200" title="更多"><i class="fas fa-ellipsis-h text-sm"></i></button>
+              <div id="moreMenu" class="hidden absolute top-full right-0 mt-2 bg-white rounded-lg shadow-xl border border-slate-200 py-1 min-w-[180px] z-50">
+                <button onclick="openBiliLink(); closeMoreMenu()" class="w-full px-4 py-2.5 text-left text-sm text-slate-600 hover:bg-slate-50 flex items-center gap-2"><i class="fas fa-external-link-alt text-slate-400 w-4"></i> 打开视频</button>
+                <button onclick="regenerate(); closeMoreMenu()" id="menuRegen" class="w-full px-4 py-2.5 text-left text-sm text-slate-600 hover:bg-slate-50 flex items-center gap-2"><i class="fas fa-redo text-slate-400 w-4"></i> 重新总结</button>
+                <div class="border-t border-slate-100 my-1"></div>
+                <button id="menuCopyTranscript" onclick="copyTranscript(); closeMoreMenu()" class="w-full px-4 py-2.5 text-left text-sm text-slate-600 hover:bg-slate-50 flex items-center gap-2"><i class="fas fa-copy text-slate-400 w-4"></i> 复制字幕</button>
+                <div class="border-t border-slate-100 my-1"></div>
+                <button onclick="deleteCurrentJob(); closeMoreMenu()" class="w-full px-4 py-2.5 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"><i class="fas fa-trash text-red-400 w-4"></i> 删除任务</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- Main content -->
+      <div class="flex-1 overflow-y-auto">
+        <div class="p-4 max-w-[1216px] mx-auto">
+          <div id="summaryCard" class="bg-white rounded-xl border border-[#E2E8F0] shadow-card overflow-hidden">
+            <div id="summaryCardHeader" class="px-6 py-4 border-b border-slate-100 bg-gradient-to-r from-pink-100/80 to-pink-50/20">
+              <div class="flex items-center justify-between gap-4">
+                <div class="flex items-center gap-2 shrink-0">
+                  <i class="fas fa-sparkles text-pink-500"></i>
+                  <h2 class="text-sm font-semibold text-slate-700 uppercase tracking-wide">AI Summary</h2>
+                </div>
+                <div id="summaryErrorAlert" class="hidden flex-1 min-w-0 bg-red-50 border border-red-200 rounded-md px-3 py-2 text-red-700 text-sm flex items-center gap-2">
+                  <i class="fas fa-exclamation-circle text-xs shrink-0"></i>
+                  <div class="min-w-0"><strong>处理失败</strong><span id="summaryErrorText" class="ml-1"></span></div>
+                </div>
+                <button onclick="retryCurrentJob()" id="summaryRetryBtn" class="hidden shrink-0 px-4 py-1.5 bg-amber-100 text-amber-700 rounded-md text-sm hover:bg-amber-200 flex items-center gap-1.5"><i class="fas fa-redo text-xs"></i> 重试</button>
+              </div>
+            </div>
+            <div class="flex flex-col lg:flex-row">
+              <div class="flex-1 min-w-0 p-4">
+                <div id="summaryLoading" class="hidden py-24 text-center"><div class="w-8 h-8 border-2 border-pink-500 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div><p class="text-sm text-slate-400">等待生成总结...</p></div>
+                <div id="summaryContent" class="summary-prose text-slate-700 text-base leading-relaxed scrollable-panel" style="height:calc(100vh - 280px)"></div>
+                <div id="summaryEmpty" class="hidden py-24 text-center"><div class="w-8 h-8 border-2 border-slate-300 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div><p class="text-sm text-slate-400">等待生成总结...</p></div>
+              </div>
+              <div class="w-full lg:w-[399px] flex-shrink-0 p-4">
+                <div class="bg-white rounded-xl border border-[#E2E8F0] shadow-card overflow-hidden">
+                  <div class="px-4 py-3 border-b border-[#F1F5F9] flex items-center justify-between" style="background:rgba(248,250,252,0.5)">
+                    <div class="flex items-center gap-2"><i class="fas fa-closed-captioning text-blue-500"></i><span class="text-sm font-semibold text-slate-600 uppercase tracking-wide">原始字幕</span><span id="transcriptMeta" class="text-xs text-slate-400 ml-1"></span></div>
+                    <button id="btnCopyTranscript" onclick="event.stopPropagation(); copyTranscript()" class="text-xs text-slate-500 hover:text-pink-500 flex items-center gap-1"><i class="fas fa-copy"></i> 复制</button>
+                    <button id="btnRetryAsr" onclick="event.stopPropagation(); retryAsrCurrentJob()" class="hidden px-4 py-1.5 bg-amber-100 text-amber-700 rounded-md text-sm hover:bg-amber-200 flex items-center gap-1.5"><i class="fas fa-redo text-xs"></i> 重新识别</button>
+                  </div>
+                  <div class="p-4"><pre id="transcriptText" class="text-sm text-slate-600 whitespace-pre-wrap leading-relaxed scrollable-panel" style="height:calc(100vh - 280px);font-family:'Noto Sans SC',sans-serif;line-height:22.75px;color:#475569">暂无字幕内容</pre></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ============ 新建任务弹窗（双栏 Tab） ============ -->
+<div id="newJobModal" class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50">
+  <div class="bg-white rounded-xl shadow-xl w-full mx-4 max-h-[90vh] flex flex-col" style="max-width:720px">
+    <!-- Header -->
+    <div class="flex items-center justify-between px-6 pt-6 pb-0 flex-shrink-0">
+      <h3 class="font-semibold text-lg">新建任务</h3>
+      <button onclick="closeNewJobModal()" class="text-slate-400 hover:text-slate-600"><i class="fas fa-times text-xl"></i></button>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex border-b border-slate-200 px-6 mt-4 flex-shrink-0">
+      <button onclick="switchNewJobTab('single')" id="newJobTabSingle" class="px-4 py-2.5 text-sm font-medium border-b-2 border-pink-500 text-pink-600 transition">单个创建</button>
+      <button onclick="switchNewJobTab('favorites')" id="newJobTabFavs" class="px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 transition">收藏夹</button>
+      <button onclick="switchNewJobTab('watchlater')" id="newJobTabWatchlater" class="px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 transition">稍后再看</button>
+    </div>
+
+    <!-- Content -->
+    <div class="flex-1 overflow-y-auto px-6 py-4 min-h-0">
+      <!-- Tab: 单个创建 -->
+      <div id="newJobPanelSingle" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1">B站视频链接</label>
+          <input type="text" id="newJobUrl" placeholder="https://www.bilibili.com/video/BV1xx411c7mD，或直接输入 BV 号" class="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-pink-300" onkeydown="if(event.key==='Enter') submitNewJob()">
+        </div>
+        <div class="flex items-center gap-2 p-3 bg-slate-50 rounded-lg">
+          <input type="checkbox" id="forceAsr" class="rounded border-slate-300 text-pink-500 w-4 h-4">
+          <label for="forceAsr" class="text-sm text-slate-600">强制使用语音识别（跳过字幕下载）</label>
+        </div>
+      </div>
+
+      <!-- Tab: 收藏夹导入 -->
+      <div id="newJobPanelFavs" class="hidden space-y-4">
+        <!-- Step 1: 收藏夹列表 -->
+        <div id="favFoldersArea">
+          <div class="flex items-center justify-between mb-2">
+            <label class="text-sm font-medium text-slate-700">选择收藏夹</label>
+            <button onclick="loadFavFolders()" id="btnReloadFavs" class="text-xs text-pink-500 hover:text-pink-600 flex items-center gap-1"><i class="fas fa-redo"></i> 刷新</button>
+          </div>
+          <!-- Initial/empty state -->
+          <div id="favInitState" class="text-center py-8 text-slate-400">
+            <i class="fas fa-folder-open text-3xl mb-2 text-slate-300"></i>
+            <p class="text-sm mb-3">加载 B站收藏夹列表</p>
+            <button onclick="loadFavFolders()" class="px-5 py-2 bg-pink-500 text-white rounded-lg text-sm hover:bg-pink-600"><i class="fas fa-sync-alt mr-1"></i> 加载我的收藏夹</button>
+          </div>
+          <!-- Loading -->
+          <div id="favLoadingFolders" class="hidden text-center py-8">
+            <div class="w-6 h-6 border-2 border-pink-500 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
+            <p class="text-xs text-slate-400">加载收藏夹...</p>
+          </div>
+          <!-- Error -->
+          <div id="favFoldersError" class="hidden text-center py-6">
+            <p class="text-sm text-red-500 mb-2"><i class="fas fa-exclamation-circle"></i> <span id="favFoldersErrorText"></span></p>
+            <button onclick="loadFavFolders()" class="text-xs text-pink-500 hover:text-pink-600">重试</button>
+          </div>
+          <!-- Folder grid -->
+          <div id="favFolderGrid" class="hidden grid grid-cols-2 gap-3"></div>
+        </div>
+
+        <!-- Step 2: 视频列表（选定收藏夹后显示） -->
+        <div id="favVideosArea" class="hidden border-t border-slate-100 pt-4">
+          <div class="flex items-center justify-between mb-2">
+            <label class="text-sm font-medium text-slate-700">
+              视频列表 <span id="favVideoFolderName" class="text-slate-400 font-normal"></span>
+            </label>
+            <button onclick="favBackToFolders()" class="text-xs text-slate-500 hover:text-slate-700 flex items-center gap-1"><i class="fas fa-arrow-left"></i> 返回</button>
+          </div>
+          <!-- Loading videos -->
+          <div id="favLoadingVideos" class="hidden text-center py-6">
+            <div class="w-6 h-6 border-2 border-pink-500 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
+            <p class="text-xs text-slate-400">加载视频...</p>
+          </div>
+          <!-- Select all -->
+          <div id="favVideosToolbar" class="hidden flex items-center justify-between py-2 px-3 bg-slate-50 rounded-lg mb-2">
+            <label class="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+              <input type="checkbox" id="favSelectAll" onchange="toggleFavSelectAll()" class="rounded border-slate-300 text-pink-500 w-4 h-4">
+              全选
+            </label>
+            <span id="favSelectedInfo" class="text-xs text-slate-400">已选 0 个</span>
+          </div>
+          <!-- Video list -->
+          <div id="favVideoList" class="hidden space-y-1.5 max-h-[320px] overflow-y-auto border border-slate-100 rounded-lg p-1"></div>
+          <!-- Empty videos -->
+          <div id="favVideosEmpty" class="hidden text-center py-6 text-slate-400">
+            <p class="text-sm">该收藏夹为空</p>
+          </div>
+          <!-- Videos error -->
+          <div id="favVideosError" class="hidden text-center py-4">
+            <p class="text-sm text-red-500"><span id="favVideosErrorText"></span></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: 稍后再看导入 -->
+      <div id="newJobPanelWatchlater" class="hidden space-y-4">
+        <div id="watchlaterArea">
+          <div class="flex items-center justify-between mb-2">
+            <label class="text-sm font-medium text-slate-700">选择视频</label>
+            <button onclick="loadWatchlater()" id="btnReloadWatchlater" class="text-xs text-pink-500 hover:text-pink-600 flex items-center gap-1"><i class="fas fa-redo"></i> 刷新</button>
+          </div>
+          <!-- Initial/empty state -->
+          <div id="watchlaterInitState" class="text-center py-8 text-slate-400">
+            <i class="fas fa-clock text-3xl mb-2 text-slate-300"></i>
+            <p class="text-sm mb-3">加载 B站稍后再看列表</p>
+            <button onclick="loadWatchlater()" class="px-5 py-2 bg-pink-500 text-white rounded-lg text-sm hover:bg-pink-600"><i class="fas fa-sync-alt mr-1"></i> 加载我的稍后再看</button>
+          </div>
+          <!-- Loading -->
+          <div id="watchlaterLoading" class="hidden text-center py-8">
+            <div class="w-6 h-6 border-2 border-pink-500 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
+            <p class="text-xs text-slate-400">加载稍后再看...</p>
+          </div>
+          <!-- Error -->
+          <div id="watchlaterError" class="hidden text-center py-6">
+            <p class="text-sm text-red-500 mb-2"><i class="fas fa-exclamation-circle"></i> <span id="watchlaterErrorText"></span></p>
+            <button onclick="loadWatchlater()" class="text-xs text-pink-500 hover:text-pink-600">重试</button>
+          </div>
+          <!-- Select all -->
+          <div id="watchlaterToolbar" class="hidden flex items-center justify-between py-2 px-3 bg-slate-50 rounded-lg mb-2">
+            <label class="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+              <input type="checkbox" id="watchlaterSelectAll" onchange="toggleWatchlaterSelectAll()" class="rounded border-slate-300 text-pink-500 w-4 h-4">
+              全选
+            </label>
+            <span id="watchlaterSelectedInfo" class="text-xs text-slate-400">已选 0 个</span>
+          </div>
+          <!-- Video list -->
+          <div id="watchlaterVideoList" class="hidden space-y-1.5 max-h-[360px] overflow-y-auto border border-slate-100 rounded-lg p-1"></div>
+          <!-- Empty -->
+          <div id="watchlaterEmpty" class="hidden text-center py-6 text-slate-400">
+            <p class="text-sm">稍后再看为空</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="flex justify-end gap-2 px-6 py-4 border-t border-slate-100 flex-shrink-0">
+      <button onclick="closeNewJobModal()" class="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg text-sm">取消</button>
+      <button id="btnSubmitSingle" onclick="submitNewJob()" class="px-4 py-2 bg-pink-500 text-white rounded-lg hover:bg-pink-600 text-sm"><i class="fas fa-play"></i> 开始处理</button>
+      <button id="btnImportFav" onclick="importFavVideos()" class="hidden px-4 py-2 bg-pink-500 text-white rounded-lg hover:bg-pink-600 text-sm"><i class="fas fa-cloud-download-alt"></i> 导入并处理 (<span id="favSelectedCount">0</span>)</button>
+      <button id="btnImportWatchlater" onclick="importWatchlaterVideos()" class="hidden px-4 py-2 bg-pink-500 text-white rounded-lg hover:bg-pink-600 text-sm"><i class="fas fa-cloud-download-alt"></i> 导入并处理 (<span id="watchlaterSelectedCount">0</span>)</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 设置弹窗 ============ -->
+<div id="settingsModal" class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50">
+  <div class="bg-white rounded-xl shadow-xl w-full max-w-2xl mx-4 max-h-[90vh] flex flex-col">
+    <div class="p-4 border-b border-slate-100 flex items-center justify-between flex-shrink-0">
+      <h3 class="font-semibold text-lg">设置</h3>
+      <button onclick="closeSettingsModal()" class="text-slate-400 hover:text-slate-600"><i class="fas fa-times text-xl"></i></button>
+    </div>
+    <div class="p-6 overflow-y-auto space-y-6">
+      <div>
+        <h4 class="font-medium mb-3 flex items-center gap-2"><i class="fas fa-microphone text-blue-500"></i> ASR 语音识别</h4>
+        <div class="space-y-3">
+          <div class="flex items-center gap-2"><input type="checkbox" id="cfgAsrEnabled" class="rounded border-slate-300 text-pink-500 w-4 h-4"><label class="text-sm text-slate-600">启用 ASR（无字幕视频时自动调用）</label></div>
+          <div><label class="block text-xs text-slate-500 mb-1">Base URL</label><input type="text" id="cfgAsrBaseUrl" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="https://api.example.com/v1"></div>
+          <div><label class="block text-xs text-slate-500 mb-1">API Key</label><div class="relative"><input type="password" id="cfgAsrKey" class="w-full px-3 py-2 pr-10 border border-slate-300 rounded-lg text-sm"><button type="button" onclick="toggleApiKeyVisibility('cfgAsrKey', this)" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1"><i class="fas fa-eye"></i></button></div></div>
+          <div><label class="block text-xs text-slate-500 mb-1">API 格式</label><select id="cfgAsrFormat" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"><option value="openai">OpenAI 兼容</option></select></div>
+          <div><label class="block text-xs text-slate-500 mb-1">模型名称</label><input type="text" id="cfgAsrModel" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="mimo-v2.5-asr"></div>
+          <div><label class="block text-xs text-slate-500 mb-1">语言</label><select id="cfgAsrLang" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"><option value="auto">自动检测</option><option value="zh">中文</option><option value="en">英文</option></select></div>
+        </div>
+      </div>
+      <div>
+        <h4 class="font-medium mb-3 flex items-center gap-2"><i class="fas fa-brain text-pink-500"></i> 总结模型</h4>
+        <div class="space-y-3">
+          <div><label class="block text-xs text-slate-500 mb-1">Base URL</label><input type="text" id="cfgSummaryBaseUrl" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="https://api.example.com/v1"></div>
+          <div><label class="block text-xs text-slate-500 mb-1">API Key</label><div class="relative"><input type="password" id="cfgSummaryKey" class="w-full px-3 py-2 pr-10 border border-slate-300 rounded-lg text-sm"><button type="button" onclick="toggleApiKeyVisibility('cfgSummaryKey', this)" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1"><i class="fas fa-eye"></i></button></div></div>
+          <div><label class="block text-xs text-slate-500 mb-1">API 格式</label><select id="cfgSummaryFormat" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"><option value="openai">OpenAI 兼容</option></select></div>
+          <div><label class="block text-xs text-slate-500 mb-1">模型名称</label><input type="text" id="cfgSummaryModel" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="mimo-v2.5"></div>
+        </div>
+      </div>
+      <div>
+        <h4 class="font-medium mb-3 flex items-center gap-2"><i class="fab fa-bilibili text-pink-500"></i> B站 Cookies</h4>
+        <div class="space-y-3">
+          <p class="text-xs text-slate-500">上传从浏览器导出的 B站 cookies.txt，用于下载受限视频/字幕和收藏夹导入。</p>
+          <div class="flex items-center gap-2">
+            <input type="file" id="cfgCookiesFile" accept=".txt" class="hidden">
+            <label for="cfgCookiesFile" class="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-600 bg-slate-50 cursor-pointer truncate hover:bg-slate-100" id="cfgCookiesFileName">点击选择 cookies.txt</label>
+            <button onclick="uploadCookies()" class="px-4 py-2 bg-slate-800 text-white rounded-lg text-sm hover:bg-slate-700 flex items-center gap-1.5"><i class="fas fa-upload"></i> 上传</button>
+          </div>
+        </div>
+      </div>
+      <div>
+        <h4 class="font-medium mb-3 flex items-center gap-2"><i class="fas fa-pen text-purple-500"></i> 总结 Prompt</h4>
+        <div class="space-y-3">
+          <div><label class="block text-xs text-slate-500 mb-1">System Prompt</label><textarea id="cfgSystemPrompt" rows="3" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono">你是一位擅长提炼长视频核心信息的编辑。请严格根据提供的视频字幕内容生成总结，不要编造视频外的信息。</textarea></div>
+          <div><label class="block text-xs text-slate-500 mb-1">User Prompt Template（必须包含 {transcript} 占位符）</label><textarea id="cfgUserPrompt" rows="4" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono">以下是一段视频的字幕内容，请帮我生成一份结构化总结：
+
+【要求】
+1. 用 2-3 句话概括视频核心主旨；
+2. 列出 3-6 个核心论点/关键步骤，每点配一句解释；
+3. 提取 1-2 个视频中提到的具体数据、案例或金句；
+4. 用 50 字以内评价该视频的信息密度与适合人群；
+5. 如果视频是教程类，请补充"实操要点"小节；如果是观点类，请补充"争议/启发"小节。
+
+【字幕内容】
+{transcript}</textarea></div>
+        </div>
+      </div>
+    </div>
+    <div class="p-4 border-t border-slate-100 flex justify-end gap-2 flex-shrink-0">
+      <button onclick="closeSettingsModal()" class="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg">取消</button>
+      <button onclick="saveSettings()" class="px-4 py-2 bg-pink-500 text-white rounded-lg hover:bg-pink-600">保存设置</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===================== Mock Data (fallback) =====================
+const mockJobs = [
+  { id:'a1b2c3d4', url:'https://www.bilibili.com/video/BV1F9NH65EAT', video_id:'BV1F9NH65EAT',
+    title:'已测-这个公众号排版技能可以给到夯', thumbnail:'https://i1.hdslb.com/bfs/archive/1b5f318aa5b8dcdd8b1515602aa63cfe097369e1.jpg',
+    description:'', uploader:'JOVEN666', duration:120, status:'completed',
+    source:'audio_asr', model:'mimo-v2.5', provider:'mimo',
+    transcript:'大家好，今天想分享一个最近非常喜欢的公众号排版技能。\n这个排版真的是我最近用的几个gzh相关的技能里面最棒的。\n颜色给的很克制，图片组件排的很高级。\n能极强地提高阅读感受。',
+    summary:'<h2>核心主旨</h2><p>公众号排版技巧分享</p><h2>要点</h2><ul><li>配色克制</li><li>图片组件高级</li><li>提升阅读感受</li></ul>',
+    created_at:'2026-07-20T10:00:00', updated_at:'2026-07-20T10:05:00', error:null },
+  { id:'e5f6g7h8', url:'https://www.bilibili.com/video/BV1dFTv6yEcZ', video_id:'BV1dFTv6yEcZ',
+    title:'某知识类长视频分享', thumbnail:'', description:'', uploader:'知识分享官', duration:1800,
+    status:'failed', source:null, model:null, provider:null, transcript:'', summary:'',
+    created_at:'2026-07-20T09:30:00', updated_at:'2026-07-20T09:32:00',
+    error:'处理失败，建议点击「重试」按钮。已识别的字幕会保留，重试不会重复消耗 ASR Token。' },
+  { id:'i9j0k1l2', url:'https://www.bilibili.com/video/BV1GCKi63ELJ', video_id:'BV1GCKi63ELJ',
+    title:'从零搭建自动化工作流教程', thumbnail:'https://i1.hdslb.com/bfs/archive/example2.jpg',
+    description:'', uploader:'效率工具控', duration:300,
+    status:'summarizing', source:'audio_asr', model:'mimo-v2.5', provider:'mimo',
+    transcript:'今天我们来讲一下如何从零开始搭建一个自动化工作流。',
+    summary:'', created_at:'2026-07-20T10:10:00', updated_at:'2026-07-20T10:12:00', error:null },
+];
+
+const STATUS_LABELS = { pending:'待处理', extracting:'提取字幕中', asr_recognizing:'语音识别中', summarizing:'总结生成中', completed:'已完成', failed:'失败' };
+const STATUS_CLASSES = { pending:'status-pending', extracting:'status-extracting', asr_recognizing:'status-asr_recognizing', summarizing:'status-summarizing', completed:'status-completed', failed:'status-failed' };
+const STATUS_ICONS = { completed:'fa-check-circle text-green-500', failed:'fa-times-circle text-red-400', summarizing:'fa-spinner fa-spin text-pink-400', extracting:'fa-spinner fa-spin text-blue-400', asr_recognizing:'fa-spinner fa-spin text-indigo-400', pending:'fa-clock text-amber-400' };
+
+// ===================== State =====================
+let jobs = [];
+let currentJobId = null;
+let currentFilter = '';
+let useMockData = true; // Start with mock, switch to real API if available
+let pollingTimer = null;
+let currentConfig = null; // 缓存后端配置，用于提交前校验
+let isLoadingJobs = true; // 初始加载状态
+
+// ===== Skeleton / Placeholder =====
+function renderSkeletons(){
+  const list = document.getElementById('jobList');
+  list.innerHTML = Array.from({length: 5}).map(() => `
+    <div class="p-[10px] rounded-lg border border-transparent">
+      <div class="flex gap-3">
+        <div class="w-16 h-12 rounded-[6px] flex-shrink-0 bg-slate-200 animate-pulse"></div>
+        <div class="flex-1 min-w-0 space-y-2 py-1">
+          <div class="h-4 bg-slate-200 rounded animate-pulse w-3/4"></div>
+          <div class="h-3 bg-slate-200 rounded animate-pulse w-1/2"></div>
+          <div class="flex gap-2 mt-1">
+            <div class="h-3 bg-slate-200 rounded animate-pulse w-16"></div>
+            <div class="h-3 bg-slate-200 rounded animate-pulse w-20"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `).join('');
+  document.getElementById('statsTotal').textContent = '加载中...';
+}
+
+// ===== Helpers =====
+function formatTime(iso){ if(!iso) return '-'; const d=new Date(iso); return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
+function formatDuration(s){ if(!s) return '-'; const m=Math.floor(s/60),sec=Math.floor(s%60); const h=Math.floor(m/60); return h>0?`${h}:${String(m%60).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${m}:${String(sec).padStart(2,'0')}`; }
+function timeAgo(iso){ if(!iso) return ''; const diff=(new Date()-new Date(iso))/1000; if(diff<60) return '刚刚'; if(diff<3600) return Math.floor(diff/60)+' min ago'; if(diff<86400) return Math.floor(diff/3600)+' 小时前'; return Math.floor(diff/86400)+' 天前'; }
+function normalizeBiliUrl(url){
+  const bv = url.match(/^(BV[a-zA-Z0-9]+)$/i);
+  if(bv) return `https://www.bilibili.com/video/${bv[1]}`;
+  const av = url.match(/^(av\d+)$/i);
+  if(av) return `https://www.bilibili.com/video/${av[1]}`;
+  if(!/^https?:\/\//i.test(url)) return `https://${url}`;
+  return url;
+}
+
+function showToast(msg, type='success'){
+  const c=document.getElementById('toastContainer');
+  const t=document.createElement('div');
+  t.className=`toast toast-${type}`;
+  const icons={success:'fa-check-circle',error:'fa-times-circle',info:'fa-info-circle'};
+  t.innerHTML=`<i class="fas ${icons[type]||'fa-info-circle'}"></i><span>${msg}</span>`;
+  c.appendChild(t);
+  requestAnimationFrame(()=>t.classList.add('show'));
+  setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},3000);
+}
+
+// ===== API Layer =====
+async function apiJson(url, opts={}){
+  try {
+    const resp = await fetch(url, { ...opts, headers: { 'Content-Type':'application/json', ...opts.headers } });
+    return await resp.json();
+  } catch(e){
+    throw e;
+  }
+}
+
+async function checkBackend(){
+  try {
+    const data = await apiJson('/api/config');
+    if(data && !data.error){
+      useMockData = false;
+      currentConfig = data; // 缓存配置，用于前端校验
+      document.getElementById('backendStatusDot').className = 'w-2 h-2 rounded-full bg-green-500';
+      document.getElementById('backendStatusText').textContent = '已连接';
+      return true;
+    }
+  } catch(e){}
+  useMockData = true;
+  currentConfig = null;
+  document.getElementById('backendStatusDot').className = 'w-2 h-2 rounded-full bg-slate-300';
+  document.getElementById('backendStatusText').textContent = '未连接';
+  return false;
+}
+
+async function fetchJobsFromApi(showSkeleton = false){
+  if(useMockData) return;
+  if(showSkeleton){
+    isLoadingJobs = true;
+    renderJobs();
+  }
+  try {
+    const params = new URLSearchParams();
+    if(currentFilter) params.set('status', currentFilter);
+    const s = document.getElementById('searchInput').value.trim();
+    if(s) params.set('search', s);
+    const data = await apiJson('/api/jobs?'+params.toString());
+    if(data && data.jobs){
+      jobs = data.jobs;
+      isLoadingJobs = false;
+      renderJobs();
+      if(currentJobId && !jobs.find(j=>j.id===currentJobId)){
+        currentJobId = null;
+        document.getElementById('emptyState').classList.remove('hidden');
+        document.getElementById('detailView').classList.add('hidden');
+      }
+      if(currentJobId){
+        const cur = jobs.find(j=>j.id===currentJobId);
+        if(cur) renderDetail(cur);
+      }
+    }
+  } catch(e){
+    // Fail silently, keep existing data
+    isLoadingJobs = false;
+    renderJobs();
+  }
+}
+
+function debouncedLoadJobs(){
+  clearTimeout(pollingTimer);
+  pollingTimer = setTimeout(() => fetchJobsFromApi(false), 400);
+}
+
+// ===== Backend Check on Load =====
+setTimeout(async ()=>{
+  const connected = await checkBackend();
+  if(connected) {
+    await fetchJobsFromApi(true);
+    // Start polling for status updates
+    setInterval(() => fetchJobsFromApi(false), 3000);
+  } else {
+    // 后端未连接，结束加载并展示空状态
+    isLoadingJobs = false;
+    renderJobs();
+  }
+}, 500);
+
+// ===== Job List =====
+function renderJobs(){
+  const list=document.getElementById('jobList');
+  if(isLoadingJobs){
+    renderSkeletons();
+    return;
+  }
+  const search=document.getElementById('searchInput').value.toLowerCase();
+  const filtered=jobs.filter(j=>{
+    const ms=!currentFilter||j.status===currentFilter;
+    const mse=!search||(j.title||'').toLowerCase().includes(search)||(j.uploader||'').toLowerCase().includes(search)||(j.video_id||'').toLowerCase().includes(search);
+    return ms&&mse;
+  });
+  document.getElementById('statsTotal').textContent=`共 ${filtered.length} 个任务`;
+  if(!filtered.length){ list.innerHTML='<div class="text-center py-8 text-slate-400"><i class="fas fa-folder-open text-3xl mb-2"></i><p class="text-sm">暂无任务</p></div>'; return; }
+  list.innerHTML=filtered.map(job=>{
+    const isActive=job.id===currentJobId;
+    const icon=STATUS_ICONS[job.status]||'fa-circle text-slate-300';
+    const leftBorder=isActive?'border-l-[4px] border-pink-400':'border-l-[4px] border-transparent';
+    return `<div onclick="selectJob('${job.id}')" class="job-card cursor-pointer p-[10px] rounded-lg transition border border-transparent ${isActive?'bg-[#FDF2F8] ring-1 ring-pink-200 '+leftBorder:'hover:bg-slate-50 border-l-[4px] border-transparent'}">
+      <div class="flex gap-3">
+        <div class="w-16 h-12 rounded-[6px] overflow-hidden flex-shrink-0 bg-[#F1F5F9] flex items-center justify-center">${job.thumbnail?`<img src="${job.thumbnail}" alt="" class="w-full h-full object-cover" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="hidden w-full h-full items-center justify-center text-slate-300"><i class="fas fa-image text-xs"></i></div>`:'<i class="fas fa-image text-slate-300 text-xs"></i>'}</div>
+        <div class="flex-1 min-w-0">
+          <p class="text-sm font-medium text-slate-800 line-clamp-1">${job.title||'未获取到标题'}</p>
+          <p class="text-xs text-slate-400 line-clamp-1 mt-0.5">${job.uploader||'-'}</p>
+          <div class="flex items-center gap-2 mt-1">
+            <span class="text-xs text-slate-400"><i class="far fa-clock"></i> ${formatDuration(job.duration)}</span>
+            <span class="text-xs flex items-center gap-1"><i class="fas ${icon}"></i> ${STATUS_LABELS[job.status]}</span>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function setFilter(s){
+  currentFilter=s;
+  document.querySelectorAll('.filter-btn').forEach(b=>{ const a=b.dataset.status===s; b.className=`filter-btn flex-1 py-1 px-2 rounded text-xs font-medium ${a?'bg-slate-800 text-white':'bg-[#F1F5F9] text-slate-600 hover:bg-slate-200'}`; });
+  renderJobs();
+  fetchJobsFromApi(false);
+}
+function toggleSearchClear(){ const i=document.getElementById('searchInput');const b=document.getElementById('searchClearBtn');if(i&&b)b.classList.toggle('hidden',!i.value); }
+function clearSearch(){ const i=document.getElementById('searchInput');if(i){i.value='';toggleSearchClear();renderJobs();fetchJobsFromApi(false);} }
+
+// ===== Detail =====
+function selectJob(id){
+  currentJobId=id;
+  renderJobs();
+  const job=jobs.find(j=>j.id===id);
+  if(!job) return;
+  document.getElementById('emptyState').classList.add('hidden');
+  document.getElementById('detailView').classList.remove('hidden');
+  document.getElementById('detailView').classList.add('flex');
+  renderDetail(job);
+}
+
+function renderDetail(job){
+  document.getElementById('detailTitle').textContent=job.title||'未获取到标题';
+  document.getElementById('detailUploader').innerHTML=`<i class="fas fa-user-circle text-xs"></i> ${job.uploader||'-'}`;
+  document.getElementById('detailDuration').innerHTML=`<i class="far fa-clock text-xs"></i> ${formatDuration(job.duration)}`;
+  const badge=document.getElementById('detailStatusBadge');
+  badge.className=`px-2 py-0.5 rounded-md text-xs font-medium ${STATUS_CLASSES[job.status]||'status-pending'}`;
+  badge.textContent=STATUS_LABELS[job.status]||job.status;
+  const thumb=document.getElementById('detailThumbnail');
+  const thumbImg=document.getElementById('detailThumbnailImg');
+  if(job.thumbnail){ thumb.classList.remove('hidden'); thumbImg.src=job.thumbnail; } else { thumb.classList.add('hidden'); }
+  const progressInline=document.getElementById('progressInline');
+  const completedHint=document.getElementById('detailCompletedHint');
+  const isProcessing=['pending','extracting','asr_recognizing','summarizing'].includes(job.status);
+  if(isProcessing){
+    progressInline.classList.remove('hidden'); progressInline.classList.add('flex');
+    completedHint.classList.add('hidden');
+    const progress={pending:5,extracting:25,asr_recognizing:55,summarizing:85}[job.status]||0;
+    document.getElementById('progressBar').style.width=`${progress}%`;
+    document.getElementById('progressPercent').textContent=`${progress}%`;
+  } else {
+    progressInline.classList.add('hidden'); progressInline.classList.remove('flex');
+    if(job.status==='completed'){ completedHint.classList.remove('hidden'); document.getElementById('completedTime').textContent='完成于 '+timeAgo(job.updated_at); }
+    else { completedHint.classList.add('hidden'); }
+  }
+  const summaryErrAlert=document.getElementById('summaryErrorAlert');
+  const summaryErrText=document.getElementById('summaryErrorText');
+  if(job.error && summaryErrAlert && summaryErrText){
+    summaryErrAlert.classList.remove('hidden');
+    summaryErrText.textContent=job.error;
+  } else if(summaryErrAlert) {
+    summaryErrAlert.classList.add('hidden');
+  }
+  const sl=document.getElementById('summaryLoading');
+  const sc=document.getElementById('summaryContent');
+  const se=document.getElementById('summaryEmpty');
+  if(job.status==='summarizing'){ sl.classList.remove('hidden'); sc.classList.add('hidden'); se.classList.add('hidden'); }
+  else if(job.summary){ sl.classList.add('hidden'); sc.classList.remove('hidden'); se.classList.add('hidden'); sc.innerHTML = (typeof marked !== 'undefined') ? marked.parse(job.summary, {breaks:true}) : job.summary; }
+  else { sl.classList.add('hidden'); sc.classList.add('hidden'); se.classList.remove('hidden'); }
+  const tt=document.getElementById('transcriptText');
+  const transcriptLoading=job.status==='extracting'||job.status==='asr_recognizing';
+  if(transcriptLoading){ tt.innerHTML='<span class="text-slate-500 flex items-center gap-2"><i class="fas fa-spinner fa-spin text-slate-400 text-xs"></i> 提取字幕中...</span>'; }
+  else { tt.textContent=job.transcript||'暂无字幕内容'; }
+  document.getElementById('transcriptMeta').textContent=job.transcript?`(${job.transcript.length} 字)`:'';
+  const menuCopyTranscript=document.getElementById('menuCopyTranscript');
+  if(menuCopyTranscript) menuCopyTranscript.classList.toggle('hidden',!job.transcript);
+  // 字幕卡片：复制 / 重新识别 按钮切换
+  const btnCopyTranscript=document.getElementById('btnCopyTranscript');
+  const btnRetryAsr=document.getElementById('btnRetryAsr');
+  const canRetryAsr = (job.status==='failed' || job.status==='asr_recognizing') && job.audio_path && !job.transcript;
+  if(btnCopyTranscript) btnCopyTranscript.classList.toggle('hidden', canRetryAsr);
+  if(btnRetryAsr) btnRetryAsr.classList.toggle('hidden', !canRetryAsr);
+  const retryBtn=document.getElementById('summaryRetryBtn');
+  if(retryBtn) retryBtn.classList.toggle('hidden',job.status!=='failed');
+}
+
+function canRetryAsr(job){
+  return (job.status==='failed' || job.status==='asr_recognizing') && job.audio_path && !job.transcript;
+}
+
+// ===== Interactions =====
+function openBiliLink(){ const job=jobs.find(j=>j.id===currentJobId); if(job&&job.url) window.open(job.url,'_blank'); }
+function toggleMoreMenu(e){ e.stopPropagation(); const m=document.getElementById('moreMenu'); m.classList.toggle('hidden'); }
+function closeMoreMenu(){ document.getElementById('moreMenu').classList.add('hidden'); }
+document.addEventListener('click',(e)=>{
+  const m=document.getElementById('moreMenu'); const btn=document.getElementById('btnMore');
+  if(m&&!m.classList.contains('hidden')&&!m.contains(e.target)&&e.target!==btn&&!btn.contains(e.target)) m.classList.add('hidden');
+});
+async function copySummary(){ try{ await navigator.clipboard.writeText(document.getElementById('summaryContent').innerText); showToast('总结已复制','success'); }catch(e){ showToast('复制失败','error'); } }
+async function copyMarkdown(){ const job=jobs.find(j=>j.id===currentJobId); try{ await navigator.clipboard.writeText(job?.summary||''); showToast('Markdown 已复制','success'); }catch(e){ showToast('复制失败','error'); } }
+async function copyTranscript(){ try{ await navigator.clipboard.writeText(document.getElementById('transcriptText').textContent); showToast('字幕已复制','success'); }catch(e){ showToast('复制失败','error'); } }
+async function regenerate(){ const job=jobs.find(j=>j.id===currentJobId); if(!job) return; if(!useMockData){
+  const apiErr = validateApiConfig(false);
+  if(apiErr){ showToast(apiErr,'error'); return; }
+  try{
+    const result = await apiJson('/api/jobs/'+job.id+'/retry',{method:'POST'});
+    if(result.error){ showToast(result.error,'error'); return; }
+    showToast('已提交重新总结','info'); fetchJobsFromApi(false);
+  }catch(e){ showToast('重试失败','error'); }
+  return;
+}
+showToast('正在重新生成总结...','info'); if(job){ job.status='summarizing'; renderDetail(job); renderJobs(); setTimeout(()=>{ job.status='completed'; job.summary='<h2>核心主旨</h2><p>这是重新生成后的总结内容。</p>'; job.updated_at=new Date().toISOString(); renderDetail(job); renderJobs(); showToast('总结已重新生成','success'); },2500); } }
+async function retryCurrentJob(){ const job=jobs.find(j=>j.id===currentJobId); if(!job) return; if(!useMockData){
+  const apiErr = validateApiConfig(false);
+  if(apiErr){ showToast(apiErr,'error'); return; }
+  try{
+    const result = await apiJson('/api/jobs/'+job.id+'/retry',{method:'POST'});
+    if(result.error){ showToast(result.error,'error'); return; }
+    showToast('任务已重新启动','info'); fetchJobsFromApi(false);
+  }catch(e){ showToast('重试失败','error'); }
+  return;
+}
+if(job){ job.status='summarizing'; job.error=null; job.updated_at=new Date().toISOString(); renderDetail(job); renderJobs(); showToast('任务已重新启动（保留字幕，不重复 ASR）','info'); setTimeout(()=>{ job.status='completed'; job.summary='<h2>核心主旨</h2><p>重试后生成的总结。</p>'; job.model='mimo-v2.5'; job.updated_at=new Date().toISOString(); renderDetail(job); renderJobs(); showToast('任务处理完成','success'); },2500); } }
+async function retryAsrCurrentJob(){ const job=jobs.find(j=>j.id===currentJobId); if(!job) return; console.log('[retryAsrCurrentJob]', job.id, job.status, job.audio_path); if(!useMockData){
+  showToast('正在提交重新识别...','info');
+  if(!canRetryAsr(job)){ showToast('当前任务没有可重新识别的音频','error'); return; }
+  const asrCfg = currentConfig?.asr || {};
+  const asrKey = (asrCfg.api_key || '').trim();
+  if(!asrKey || asrKey.includes('YOUR_')){ showToast('ASR API Key 未配置，请先在设置页填写','error'); return; }
+  try{
+    const result = await apiJson('/api/jobs/'+job.id+'/retry-asr',{method:'POST'});
+    if(result.error){ showToast(result.error,'error'); return; }
+    showToast('已提交重新识别音频','info'); fetchJobsFromApi(false);
+  }catch(e){ showToast('重新识别失败','error'); }
+  return;
+}
+if(job){ job.status='asr_recognizing'; job.error=null; job.transcript=''; job.updated_at=new Date().toISOString(); renderDetail(job); renderJobs(); showToast('重新识别中（演示）','info'); setTimeout(()=>{ job.status='summarizing'; job.transcript='这是重新识别后的字幕内容。'; job.updated_at=new Date().toISOString(); renderDetail(job); renderJobs(); setTimeout(()=>{ job.status='completed'; job.summary='<h2>核心主旨</h2><p>重试后生成的总结。</p>'; job.updated_at=new Date().toISOString(); renderDetail(job); renderJobs(); showToast('任务处理完成','success'); },1500); },2500); } }
+async function deleteCurrentJob(){ if(!currentJobId) return; if(!confirm('确定删除这个任务？')) return; if(!useMockData){ try{ await apiJson('/api/jobs/'+currentJobId,{method:'DELETE'}); }catch(e){} fetchJobsFromApi(false); } jobs=jobs.filter(j=>j.id!==currentJobId); currentJobId=null; document.getElementById('detailView').classList.add('hidden'); document.getElementById('detailView').classList.remove('flex'); document.getElementById('emptyState').classList.remove('hidden'); renderJobs(); showToast('任务已删除','success'); }
+
+// ===== New Job Modal & Tabs =====
+let currentJobTab = 'single';
+
+function openNewJobModal(){
+  document.getElementById('newJobModal').classList.remove('hidden');
+  document.getElementById('newJobModal').classList.add('flex');
+  if(currentJobTab === 'single'){
+    document.getElementById('newJobUrl').focus();
+  }
+}
+
+function closeNewJobModal(){
+  document.getElementById('newJobModal').classList.add('hidden');
+  document.getElementById('newJobModal').classList.remove('flex');
+  document.getElementById('newJobUrl').value='';
+  document.getElementById('forceAsr').checked=false;
+  // Reset favorites state
+  resetFavState();
+  // Reset watchlater state
+  resetWatchlaterState();
+}
+
+function switchNewJobTab(tab){
+  currentJobTab = tab;
+  // Toggle button styles
+  const btnSingle = document.getElementById('newJobTabSingle');
+  const btnFavs = document.getElementById('newJobTabFavs');
+  const btnWatchlater = document.getElementById('newJobTabWatchlater');
+  const panelSingle = document.getElementById('newJobPanelSingle');
+  const panelFavs = document.getElementById('newJobPanelFavs');
+  const panelWatchlater = document.getElementById('newJobPanelWatchlater');
+  const btnSubmit = document.getElementById('btnSubmitSingle');
+  const btnImportFav = document.getElementById('btnImportFav');
+  const btnImportWatchlater = document.getElementById('btnImportWatchlater');
+
+  const activeClass = 'px-4 py-2.5 text-sm font-medium border-b-2 border-pink-500 text-pink-600 transition';
+  const inactiveClass = 'px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 transition';
+
+  btnSingle.className = tab === 'single' ? activeClass : inactiveClass;
+  btnFavs.className = tab === 'favorites' ? activeClass : inactiveClass;
+  btnWatchlater.className = tab === 'watchlater' ? activeClass : inactiveClass;
+
+  panelSingle.classList.toggle('hidden', tab !== 'single');
+  panelFavs.classList.toggle('hidden', tab !== 'favorites');
+  panelWatchlater.classList.toggle('hidden', tab !== 'watchlater');
+
+  btnSubmit.classList.toggle('hidden', tab !== 'single');
+  btnImportFav.classList.toggle('hidden', tab !== 'favorites');
+  btnImportWatchlater.classList.toggle('hidden', tab !== 'watchlater');
+
+  if(tab === 'single'){
+    setTimeout(()=>document.getElementById('newJobUrl').focus(), 50);
+  } else if(tab === 'favorites'){
+    if(fav.folders.length === 0 && fav.status !== 'loading_folders'){
+      loadFavFolders();
+    }
+  } else if(tab === 'watchlater'){
+    if(watchlater.videos.length === 0 && watchlater.status !== 'loading'){
+      loadWatchlater();
+    }
+  }
+}
+
+async function submitNewJob(){
+  let url=document.getElementById('newJobUrl').value.trim();
+  if(!url){ showToast('请输入链接','error'); return; }
+  url = normalizeBiliUrl(url);
+  document.getElementById('newJobUrl').value = url;
+  const forceAsr=document.getElementById('forceAsr').checked;
+
+  const apiErr = validateApiConfig(forceAsr);
+  if(apiErr){ showToast(apiErr,'error'); return; }
+
+  // 检查是否已存在相同视频任务
+  const existing = jobs.filter(j => normalizeBiliUrl(j.url) === url || j.url === url);
+  if(existing.length > 0){
+    const confirmed = confirm(`检测到已存在 ${existing.length} 个相同视频的任务。\n\n是否仍要创建新任务？`);
+    if(!confirmed) return;
+  }
+
+  if(!useMockData){
+    try {
+      const result = await apiJson('/api/jobs', {
+        method:'POST', body: JSON.stringify({url, force_asr: forceAsr})
+      });
+      if(result.error){ showToast(result.error, 'error'); return; }
+      closeNewJobModal();
+      showToast('任务创建成功','success');
+      await fetchJobsFromApi(false);
+      selectJob(result.id);
+      return;
+    } catch(e){
+      showToast('创建失败，请检查后端是否运行','error');
+      return;
+    }
+  }
+
+  // Mock fallback
+  const id=Math.random().toString(36).substr(2,8);
+  const newJob={id,url,video_id:'BV'+Math.random().toString(36).substr(2,8),title:'新建任务 - '+url.split('/').pop(),thumbnail:'',description:'',uploader:'',duration:null,status:'extracting',source:null,model:null,provider:null,transcript:'',summary:'',created_at:new Date().toISOString(),updated_at:new Date().toISOString(),error:null};
+  jobs.unshift(newJob); renderJobs(); closeNewJobModal(); selectJob(id); showToast('任务创建成功','success');
+}
+
+// ===== Favorites Import =====
+const fav = {
+  status: 'initial', // initial | loading_folders | folders_loaded | loading_videos | videos_loaded | error
+  folders: [],
+  selectedFolderId: null,
+  selectedFolderTitle: '',
+  videos: [],
+  selectedBvs: new Set(),
+  error: '',
+};
+
+function resetFavState(){
+  fav.status = 'initial';
+  fav.folders = [];
+  fav.selectedFolderId = null;
+  fav.videos = [];
+  fav.selectedBvs = new Set();
+  fav.error = '';
+  renderFavFoldersArea();
+  renderFavVideosArea();
+}
+
+// -- Load Folders --
+async function loadFavFolders(){
+  fav.status = 'loading_folders';
+  fav.error = '';
+  renderFavFoldersArea();
+
+  try {
+    const data = await apiJson('/api/favorites');
+    if(data.error){
+      if(data.code === 'no_cookie'){
+        fav.status = 'error';
+        fav.error = '未配置 B站 cookies，请先在设置页上传 cookies.txt';
+      } else {
+        fav.status = 'error';
+        fav.error = data.error;
+      }
+      renderFavFoldersArea();
+      return;
+    }
+    fav.folders = data.folders || [];
+    fav.status = fav.folders.length > 0 ? 'folders_loaded' : 'error';
+    if(fav.status === 'error' && !fav.error) fav.error = '没有找到收藏夹';
+    renderFavFoldersArea();
+  } catch(e){
+    fav.status = 'error';
+    fav.error = '请求失败，后端未运行？';
+    renderFavFoldersArea();
+  }
+}
+
+// -- Select Folder --
+async function selectFavFolder(folderId, title){
+  fav.selectedFolderId = folderId;
+  fav.selectedFolderTitle = title;
+  fav.status = 'loading_videos';
+  fav.videos = [];
+  fav.selectedBvs = new Set();
+  renderFavFoldersArea();
+  renderFavVideosArea();
+
+  try {
+    const data = await apiJson('/api/favorites/'+folderId);
+    if(data.error){
+      fav.status = 'error';
+      fav.error = data.error;
+      renderFavVideosArea();
+      return;
+    }
+    fav.videos = data.videos || [];
+    fav.status = 'videos_loaded';
+    renderFavVideosArea();
+  } catch(e){
+    fav.status = 'error';
+    fav.error = '请求失败';
+    renderFavVideosArea();
+  }
+}
+
+function favBackToFolders(){
+  fav.selectedFolderId = null;
+  fav.videos = [];
+  fav.selectedBvs = new Set();
+  renderFavVideosArea();
+}
+
+function toggleFavVideo(bv){
+  if(fav.selectedBvs.has(bv)) fav.selectedBvs.delete(bv);
+  else fav.selectedBvs.add(bv);
+  renderFavVideosArea();
+  updateFavImportBtn();
+}
+
+function toggleFavSelectAll(){
+  const checked = document.getElementById('favSelectAll').checked;
+  if(checked) fav.videos.forEach(v => fav.selectedBvs.add(v.bv));
+  else fav.selectedBvs.clear();
+  renderFavVideosArea();
+  updateFavImportBtn();
+}
+
+function updateFavImportBtn(){
+  const count = fav.selectedBvs.size;
+  document.getElementById('favSelectedCount').textContent = count;
+  const btn = document.getElementById('btnImportFav');
+  if(count > 0) btn.classList.remove('hidden');
+  else btn.classList.add('hidden');
+}
+
+async function importFavVideos(){
+  const videos = fav.videos.filter(v => fav.selectedBvs.has(v.bv));
+  if(videos.length === 0){ showToast('请先选择视频', 'error'); return; }
+
+  const apiErr = validateApiConfig(false);
+  if(apiErr){ showToast(apiErr,'error'); return; }
+
+  // 检查重复任务
+  const duplicateBvs = videos.filter(v => jobs.some(j => j.video_id === v.bv)).map(v => v.bv);
+  if(duplicateBvs.length > 0){
+    const confirmed = confirm(`检测到 ${duplicateBvs.length} 个已存在相同视频的任务。\n\n是否仍要导入这些视频并创建新任务？`);
+    if(!confirmed){
+      // 只导入未重复的视频
+      const newVideos = videos.filter(v => !jobs.some(j => j.video_id === v.bv));
+      if(newVideos.length === 0){ showToast('没有新的视频可导入', 'info'); return; }
+      // 继续用 newVideos 导入
+      return doBatchImport(newVideos, false);
+    }
+  }
+
+  return doBatchImport(videos, false);
+}
+
+async function doBatchImport(videos, forceAsr){
+  try {
+    const data = await apiJson('/api/jobs/batch', {
+      method: 'POST', body: JSON.stringify({ videos, force_asr: forceAsr })
+    });
+    if(data.error){ showToast(data.error, 'error'); return; }
+    closeNewJobModal();
+    showToast(`已导入 ${data.total} 个任务，逐个串行处理中`, 'success');
+    await fetchJobsFromApi(false);
+  } catch(e){
+    showToast('导入失败', 'error');
+  }
+}
+
+// -- Render Favorites Folders Area --
+function renderFavFoldersArea(){
+  const initEl = document.getElementById('favInitState');
+  const loadingEl = document.getElementById('favLoadingFolders');
+  const errorEl = document.getElementById('favFoldersError');
+  const errorText = document.getElementById('favFoldersErrorText');
+  const gridEl = document.getElementById('favFolderGrid');
+
+  [initEl, loadingEl, errorEl, gridEl].forEach(el => el.classList.add('hidden'));
+
+  if(fav.status === 'initial' || fav.status === 'error'){
+    if(fav.status === 'error' && fav.error){
+      errorEl.classList.remove('hidden');
+      errorText.textContent = fav.error;
+    } else {
+      initEl.classList.remove('hidden');
+    }
+  } else if(fav.status === 'loading_folders'){
+    loadingEl.classList.remove('hidden');
+  } else if(fav.status === 'folders_loaded' || fav.status === 'loading_videos' || fav.status === 'videos_loaded'){
+    gridEl.classList.remove('hidden');
+    gridEl.innerHTML = fav.folders.map(f => {
+      const selected = fav.selectedFolderId === f.id;
+      return `<div onclick="selectFavFolder(${f.id}, '${f.title.replace(/'/g, "\\'")}')"
+        class="cursor-pointer rounded-lg border ${selected ? 'border-pink-400 bg-pink-50 ring-1 ring-pink-200' : 'border-slate-200 hover:border-pink-300 hover:bg-slate-50'} p-3 transition">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-lg overflow-hidden flex-shrink-0 bg-slate-100 ${selected ? 'ring-2 ring-pink-300' : ''}">
+            ${f.cover ? `<img src="${f.cover}" alt="" class="w-full h-full object-cover" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><div class="hidden w-full h-full items-center justify-center text-slate-300"><i class="fas fa-folder text-xs"></i></div>` : `<div class="w-full h-full flex items-center justify-center text-slate-300"><i class="fas fa-folder text-sm"></i></div>`}
+          </div>
+          <div class="min-w-0 flex-1">
+            <p class="text-sm font-medium text-slate-800 line-clamp-1 ${selected ? 'text-pink-600' : ''}">${f.title}</p>
+            <p class="text-xs text-slate-400">${f.count} 个视频</p>
+          </div>
+          ${selected ? '<i class="fas fa-check-circle text-pink-500 text-sm flex-shrink-0"></i>' : ''}
+        </div>
+      </div>`;
+    }).join('');
+  }
+}
+
+// -- Render Favorites Videos Area --
+function renderFavVideosArea(){
+  const area = document.getElementById('favVideosArea');
+  const nameEl = document.getElementById('favVideoFolderName');
+  const loadingEl = document.getElementById('favLoadingVideos');
+  const toolbarEl = document.getElementById('favVideosToolbar');
+  const listEl = document.getElementById('favVideoList');
+  const emptyEl = document.getElementById('favVideosEmpty');
+  const errEl = document.getElementById('favVideosError');
+  const errText = document.getElementById('favVideosErrorText');
+  const selectAll = document.getElementById('favSelectAll');
+
+  if(!fav.selectedFolderId){
+    area.classList.add('hidden');
+    return;
+  }
+  area.classList.remove('hidden');
+  nameEl.textContent = `- ${fav.selectedFolderTitle}`;
+
+  [loadingEl, toolbarEl, listEl, emptyEl, errEl].forEach(el => el.classList.add('hidden'));
+
+  if(fav.status === 'loading_videos'){
+    loadingEl.classList.remove('hidden');
+  } else if(fav.status === 'videos_loaded'){
+    if(fav.videos.length === 0){
+      emptyEl.classList.remove('hidden');
+    } else {
+      toolbarEl.classList.remove('hidden');
+      listEl.classList.remove('hidden');
+      const allSelected = fav.videos.every(v => fav.selectedBvs.has(v.bv));
+      selectAll.checked = allSelected;
+      document.getElementById('favSelectedInfo').textContent = `已选 ${fav.selectedBvs.size} / ${fav.videos.length} 个`;
+      listEl.innerHTML = fav.videos.map(v => {
+        const checked = fav.selectedBvs.has(v.bv);
+        return `<div onclick="toggleFavVideo('${v.bv}')" class="flex items-center gap-3 px-2 py-2 rounded-lg cursor-pointer transition ${checked ? 'bg-pink-50' : 'hover:bg-slate-50'}">
+          <input type="checkbox" ${checked?'checked':''} class="rounded border-slate-300 text-pink-500 w-4 h-4 flex-shrink-0 pointer-events-none">
+          <div class="w-12 h-8 rounded overflow-hidden flex-shrink-0 bg-slate-100 flex items-center justify-center text-slate-300">
+            ${v.cover ? `<img src="${v.cover}" alt="" class="w-full h-full object-cover" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="hidden"><i class="fas fa-image text-xs"></i></span>` : '<i class="fas fa-image text-xs"></i>'}
+          </div>
+          <div class="min-w-0 flex-1">
+            <p class="text-sm text-slate-800 line-clamp-1 ${checked ? 'font-medium' : ''}">${v.title||'未获取到标题'}</p>
+            <p class="text-xs text-slate-400 line-clamp-1">${v.uploader||'-'} · ${formatDuration(v.duration)}</p>
+          </div>
+          <span class="text-xs text-slate-400 font-mono flex-shrink-0">${v.bv}</span>
+        </div>`;
+      }).join('');
+    }
+  } else if(fav.status === 'error' && fav.error){
+    errEl.classList.remove('hidden');
+    errText.textContent = fav.error;
+  }
+}
+
+// ===== Watch Later Import =====
+const watchlater = {
+  status: 'initial', // initial | loading | loaded | error
+  videos: [],
+  selectedBvs: new Set(),
+  error: '',
+};
+
+function resetWatchlaterState(){
+  watchlater.status = 'initial';
+  watchlater.videos = [];
+  watchlater.selectedBvs = new Set();
+  watchlater.error = '';
+  renderWatchlaterArea();
+}
+
+async function loadWatchlater(){
+  watchlater.status = 'loading';
+  watchlater.error = '';
+  renderWatchlaterArea();
+
+  try {
+    const data = await apiJson('/api/watchlater');
+    if(data.error){
+      if(data.code === 'no_cookie'){
+        watchlater.status = 'error';
+        watchlater.error = '未配置 B站 cookies，请先在设置页上传 cookies.txt';
+      } else {
+        watchlater.status = 'error';
+        watchlater.error = data.error;
+      }
+      renderWatchlaterArea();
+      return;
+    }
+    watchlater.videos = data.videos || [];
+    watchlater.status = watchlater.videos.length > 0 ? 'loaded' : 'empty';
+    renderWatchlaterArea();
+  } catch(e){
+    watchlater.status = 'error';
+    watchlater.error = '请求失败，后端未运行？';
+    renderWatchlaterArea();
+  }
+}
+
+function toggleWatchlaterVideo(bv){
+  if(watchlater.selectedBvs.has(bv)) watchlater.selectedBvs.delete(bv);
+  else watchlater.selectedBvs.add(bv);
+  renderWatchlaterArea();
+  updateWatchlaterImportBtn();
+}
+
+function toggleWatchlaterSelectAll(){
+  const checked = document.getElementById('watchlaterSelectAll').checked;
+  if(checked) watchlater.videos.forEach(v => watchlater.selectedBvs.add(v.bv));
+  else watchlater.selectedBvs.clear();
+  renderWatchlaterArea();
+  updateWatchlaterImportBtn();
+}
+
+function updateWatchlaterImportBtn(){
+  const count = watchlater.selectedBvs.size;
+  document.getElementById('watchlaterSelectedCount').textContent = count;
+}
+
+async function importWatchlaterVideos(){
+  const videos = watchlater.videos.filter(v => watchlater.selectedBvs.has(v.bv));
+  if(videos.length === 0){ showToast('请先选择视频', 'error'); return; }
+
+  const apiErr = validateApiConfig(false);
+  if(apiErr){ showToast(apiErr,'error'); return; }
+
+  // 检查重复任务
+  const duplicateBvs = videos.filter(v => jobs.some(j => j.video_id === v.bv)).map(v => v.bv);
+  if(duplicateBvs.length > 0){
+    const confirmed = confirm(`检测到 ${duplicateBvs.length} 个已存在相同视频的任务。\n\n是否仍要导入这些视频并创建新任务？`);
+    if(!confirmed){
+      const newVideos = videos.filter(v => !jobs.some(j => j.video_id === v.bv));
+      if(newVideos.length === 0){ showToast('没有新的视频可导入', 'info'); return; }
+      return doBatchImport(newVideos, false);
+    }
+  }
+
+  return doBatchImport(videos, false);
+}
+
+function renderWatchlaterArea(){
+  const initEl = document.getElementById('watchlaterInitState');
+  const loadingEl = document.getElementById('watchlaterLoading');
+  const errorEl = document.getElementById('watchlaterError');
+  const errorText = document.getElementById('watchlaterErrorText');
+  const toolbarEl = document.getElementById('watchlaterToolbar');
+  const listEl = document.getElementById('watchlaterVideoList');
+  const emptyEl = document.getElementById('watchlaterEmpty');
+  const selectAll = document.getElementById('watchlaterSelectAll');
+
+  [initEl, loadingEl, errorEl, toolbarEl, listEl, emptyEl].forEach(el => el.classList.add('hidden'));
+
+  if(watchlater.status === 'initial'){
+    initEl.classList.remove('hidden');
+  } else if(watchlater.status === 'loading'){
+    loadingEl.classList.remove('hidden');
+  } else if(watchlater.status === 'error'){
+    errorEl.classList.remove('hidden');
+    errorText.textContent = watchlater.error;
+  } else if(watchlater.status === 'empty'){
+    emptyEl.classList.remove('hidden');
+  } else if(watchlater.status === 'loaded'){
+    toolbarEl.classList.remove('hidden');
+    listEl.classList.remove('hidden');
+    const allSelected = watchlater.videos.every(v => watchlater.selectedBvs.has(v.bv));
+    selectAll.checked = allSelected;
+    document.getElementById('watchlaterSelectedInfo').textContent = `已选 ${watchlater.selectedBvs.size} / ${watchlater.videos.length} 个`;
+    listEl.innerHTML = watchlater.videos.map(v => {
+      const checked = watchlater.selectedBvs.has(v.bv);
+      return `<div onclick="toggleWatchlaterVideo('${v.bv}')" class="flex items-center gap-3 px-2 py-2 rounded-lg cursor-pointer transition ${checked ? 'bg-pink-50' : 'hover:bg-slate-50'}">
+        <input type="checkbox" ${checked?'checked':''} class="rounded border-slate-300 text-pink-500 w-4 h-4 flex-shrink-0 pointer-events-none">
+        <div class="w-12 h-8 rounded overflow-hidden flex-shrink-0 bg-slate-100 flex items-center justify-center text-slate-300">
+          ${v.cover ? `<img src="${v.cover}" alt="" class="w-full h-full object-cover" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"><span class="hidden"><i class="fas fa-image text-xs"></i></span>` : '<i class="fas fa-image text-xs"></i>'}
+        </div>
+        <div class="min-w-0 flex-1">
+          <p class="text-sm text-slate-800 line-clamp-1 ${checked ? 'font-medium' : ''}">${v.title||'未获取到标题'}</p>
+          <p class="text-xs text-slate-400 line-clamp-1">${v.uploader||'-'} · ${formatDuration(v.duration)}</p>
+        </div>
+        <span class="text-xs text-slate-400 font-mono flex-shrink-0">${v.bv}</span>
+      </div>`;
+    }).join('');
+  }
+
+  updateWatchlaterImportBtn();
+}
+
+// ===== Settings Modal =====
+function openSettingsModal(){
+  document.getElementById('settingsModal').classList.remove('hidden');
+  document.getElementById('settingsModal').classList.add('flex');
+  loadSettings(); // 打开时自动拉取最新配置
+}
+function closeSettingsModal(){
+  document.getElementById('settingsModal').classList.add('hidden');
+  document.getElementById('settingsModal').classList.remove('flex');
+}
+
+function _getInputValue(id, fallback=''){
+  const el = document.getElementById(id);
+  return el ? el.value.trim() : fallback;
+}
+function _getCheckboxValue(id){
+  const el = document.getElementById(id);
+  return el ? el.checked : false;
+}
+
+async function loadSettings(){
+  if(useMockData){
+    // 后端未连接时仅给提示，不阻断用户继续查看已填内容
+    showToast('后端未连接，无法加载配置', 'error');
+    return;
+  }
+  try {
+    const cfg = await apiJson('/api/config');
+    if(cfg.error){ showToast('加载配置失败：' + cfg.error, 'error'); return; }
+    currentConfig = cfg;
+
+    // ASR
+    document.getElementById('cfgAsrEnabled').checked = cfg.asr?.enabled ?? false;
+    document.getElementById('cfgAsrBaseUrl').value = cfg.asr?.base_url ?? '';
+    document.getElementById('cfgAsrKey').value = cfg.asr?.api_key ?? '';
+    document.getElementById('cfgAsrFormat').value = cfg.asr?.api_format ?? 'openai';
+    document.getElementById('cfgAsrModel').value = cfg.asr?.model ?? '';
+    document.getElementById('cfgAsrLang').value = cfg.asr?.language ?? 'auto';
+
+    // 总结模型
+    document.getElementById('cfgSummaryBaseUrl').value = cfg.summary?.base_url ?? '';
+    document.getElementById('cfgSummaryKey').value = cfg.summary?.api_key ?? '';
+    document.getElementById('cfgSummaryFormat').value = cfg.summary?.api_format ?? 'openai';
+    document.getElementById('cfgSummaryModel').value = cfg.summary?.model ?? '';
+
+    // Cookies
+    const cookiesFile = cfg.bilibili?.cookies_file || '';
+    document.getElementById('cfgCookiesFileName').textContent = cookiesFile
+      ? cookiesFile.split(/[\\/]/).pop()
+      : '点击选择 cookies.txt';
+
+    // Prompt
+    document.getElementById('cfgSystemPrompt').value = cfg.summary_prompt?.system_prompt ?? '';
+    document.getElementById('cfgUserPrompt').value = cfg.summary_prompt?.user_prompt_template ?? '';
+  } catch(e){
+    showToast('加载配置失败，请检查后端连接', 'error');
+  }
+}
+
+async function saveSettings(){
+  if(useMockData){
+    showToast('后端未连接，无法保存配置', 'error');
+    return;
+  }
+  const payload = {
+    asr: {
+      enabled: _getCheckboxValue('cfgAsrEnabled'),
+      base_url: _getInputValue('cfgAsrBaseUrl'),
+      api_key: _getInputValue('cfgAsrKey'),
+      api_format: document.getElementById('cfgAsrFormat').value || 'openai',
+      model: _getInputValue('cfgAsrModel'),
+      language: document.getElementById('cfgAsrLang').value || 'auto',
+    },
+    summary: {
+      base_url: _getInputValue('cfgSummaryBaseUrl'),
+      api_key: _getInputValue('cfgSummaryKey'),
+      api_format: document.getElementById('cfgSummaryFormat').value || 'openai',
+      model: _getInputValue('cfgSummaryModel'),
+    },
+    summary_prompt: {
+      system_prompt: document.getElementById('cfgSystemPrompt').value,
+      user_prompt_template: document.getElementById('cfgUserPrompt').value,
+    },
+  };
+
+  try {
+    const result = await apiJson('/api/config', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    if(result.error){ showToast('保存失败：' + result.error, 'error'); return; }
+    showToast('设置已保存', 'success');
+    closeSettingsModal();
+    await loadSettings(); // 刷新缓存与输入框
+    await checkBackend();  // 刷新后端连接状态
+  } catch(e){
+    showToast('保存失败，请检查后端是否运行', 'error');
+  }
+}
+
+function validateApiConfig(forceAsr=false){
+  if(useMockData) return null; // 离线演示模式不阻塞
+  if(!currentConfig) return '无法获取 API 配置，请等待后端连接或刷新页面';
+
+  const summaryKey = (currentConfig.summary?.api_key || '').trim();
+  if(!summaryKey || summaryKey.includes('YOUR_')){
+    return '总结模型 API Key 未配置，请先在设置页填写并保存';
+  }
+
+  const asrCfg = currentConfig.asr || {};
+  if(forceAsr || asrCfg.enabled){
+    const asrKey = (asrCfg.api_key || '').trim();
+    if(!asrKey || asrKey.includes('YOUR_')){
+      return 'ASR 语音识别 API Key 未配置，请先在设置页填写并保存';
+    }
+  }
+  return null;
+}
+
+function toggleApiKeyVisibility(inputId, btn){ const input=document.getElementById(inputId); const icon=btn.querySelector('i'); if(input.type==='password'){ input.type='text'; icon.classList.remove('fa-eye'); icon.classList.add('fa-eye-slash'); } else { input.type='password'; icon.classList.remove('fa-eye-slash'); icon.classList.add('fa-eye'); } }
+
+// 监听文件选择，更新文件名显示
+(function initCookiesFileInput(){
+  const fileInput = document.getElementById('cfgCookiesFile');
+  if(!fileInput) return;
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    document.getElementById('cfgCookiesFileName').textContent = file ? file.name : '点击选择 cookies.txt';
+  });
+})();
+
+async function uploadCookies(){
+  const fileInput = document.getElementById('cfgCookiesFile');
+  const file = fileInput ? fileInput.files[0] : null;
+  if(!file){
+    showToast('请先选择 cookies.txt', 'error');
+    return;
+  }
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const resp = await fetch('/api/upload/cookies', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if(data.error){ showToast('上传失败：' + data.error, 'error'); return; }
+    showToast('Cookies 已上传并保存', 'success');
+    await loadSettings(); // 刷新配置文件名
+  } catch(e){
+    showToast('上传失败，请检查后端是否运行', 'error');
+  }
+}
+
+// ===== Init =====
+renderSkeletons();
+</script>
+</body>
+</html>

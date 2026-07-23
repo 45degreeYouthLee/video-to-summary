@@ -1,0 +1,68 @@
+asr:
+  enabled: true
+  base_url: wss://openspeech.bytedance.com/api/v3/plan/sauc/bigmodel_nostream
+  api_key: YOUR_ASR_API_KEY
+  api_format: openai
+  model: volc.seedasr.sauc.duration
+  language: auto
+  segment_duration_ms: 1000
+  split_threshold_minutes: 10
+  total_timeout_seconds: null
+  timeout_min_seconds: 180
+  timeout_audio_multiplier: 2.0
+  timeout_buffer_seconds: 120
+summary:
+  base_url: https://token-plan-cn.xiaomimimo.com/v1
+  api_key: YOUR_SUMMARY_API_KEY
+  api_format: openai
+  model: mimo-v2.5
+  max_context_tokens: 6000
+bilibili:
+  cookies_file: space.bilibili.com_cookies.txt
+paths:
+  yt_dlp_path: yt-dlp
+  temp_dir: ./temp
+  output_dir: ./output
+summary_prompt:
+  system_prompt: '你是一位擅长提炼长视频核心信息的编辑。请严格根据提供的视频字幕内容生成总结，不要编造视频外的信息。
+
+    '
+  user_prompt_template: '以下是一段视频的字幕内容，请帮我生成一份结构化总结：
+
+
+    【要求】
+
+    1. 用 2-3 句话概括视频核心主旨；
+
+    2. 列出 3-6 个核心论点/关键步骤，每点配一句解释；
+
+    3. 提取 1-2 个视频中提到的具体数据、案例或金句；
+
+    4. 用 50 字以内评价该视频的信息密度与适合人群；
+
+    5. 如果视频是教程类，请补充"实操要点"小节；如果是观点类，请补充"争议/启发"小节。
+
+    6. 请使用 Markdown 格式输出，合理使用标题、列表、加粗等排版元素，便于阅读。
+
+
+    【字幕内容】
+
+    {transcript}
+
+    '
+  max_tokens: 2048
+  temperature: 0.3
+cleaning:
+  filler_words:
+  - '[（(]哦[）)]'
+  - '[（(]嗯[）)]'
+  - '[（(]啊[）)]'
+  - '[（(]这个[）)]'
+  - '[（(]那个[）)]'
+  - '[（(]然后[）)]'
+  - '[（(]就是[）)]'
+  - '[（(]对吧[）)]'
+  - 那么
+  - 大家
+  min_sentence_length: 8
+  merge_gap_seconds: 3
