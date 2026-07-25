@@ -26,6 +26,7 @@
 ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
 .status-completed { background: #d1fae5; color: #065f46; }
 .status-pending { background: #fef3c7; color: #92400e; }
+.status-queued { background: #ede9fe; color: #5b21b6; }
 .status-extracting { background: #dbeafe; color: #1e40af; }
 .status-asr_recognizing { background: #e0e7ff; color: #3730a3; }
 .status-summarizing { background: #fce7f3; color: #9d174d; }
@@ -200,7 +201,7 @@ function toggleMobileSidebar(){
             <div class="flex flex-col lg:flex-row">
               <div class="flex-1 min-w-0 p-4">
                 <div id="summaryLoading" class="hidden py-24 text-center"><div class="w-8 h-8 border-2 border-pink-500 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div><p class="text-sm text-slate-400">等待生成总结...</p></div>
-                <div id="summaryContent" class="summary-prose text-slate-700 text-base leading-relaxed scrollable-panel" style="height:calc(100vh - 280px)"></div>
+                <div id="summaryContent" class="summary-prose text-slate-700 text-base leading-relaxed scrollable-panel" style="height:calc(100vh - 192px)"></div>
                 <div id="summaryEmpty" class="hidden py-24 text-center"><div class="w-8 h-8 border-2 border-slate-300 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div><p class="text-sm text-slate-400">等待生成总结...</p></div>
               </div>
               <div class="w-full lg:w-[399px] flex-shrink-0 p-4">
@@ -407,7 +408,7 @@ function toggleMobileSidebar(){
         <h4 class="font-medium mb-3 flex items-center gap-2"><i class="fas fa-pen text-purple-500"></i> 总结 Prompt</h4>
         <div class="space-y-3">
           <div><label class="block text-xs text-slate-500 mb-1">System Prompt</label><textarea id="cfgSystemPrompt" rows="3" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono">你是一位擅长提炼长视频核心信息的编辑。请严格根据提供的视频字幕内容生成总结，不要编造视频外的信息。</textarea></div>
-          <div><label class="block text-xs text-slate-500 mb-1">User Prompt Template（必须包含 {transcript} 占位符）</label><textarea id="cfgUserPrompt" rows="4" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono">以下是一段视频的字幕内容，请帮我生成一份结构化总结：
+          <div><label class="block text-xs text-slate-500 mb-1">User Prompt Template（必填 {transcript}；可选 {title}、{uploader}、{duration}）</label><textarea id="cfgUserPrompt" rows="4" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono">以下是一段视频的字幕内容，请帮我生成一份结构化总结：
 
 【要求】
 1. 用 2-3 句话概括视频核心主旨；
@@ -451,9 +452,9 @@ const mockJobs = [
     summary:'', created_at:'2026-07-20T10:10:00', updated_at:'2026-07-20T10:12:00', error:null },
 ];
 
-const STATUS_LABELS = { pending:'待处理', extracting:'提取字幕中', asr_recognizing:'语音识别中', summarizing:'总结生成中', completed:'已完成', failed:'失败' };
-const STATUS_CLASSES = { pending:'status-pending', extracting:'status-extracting', asr_recognizing:'status-asr_recognizing', summarizing:'status-summarizing', completed:'status-completed', failed:'status-failed' };
-const STATUS_ICONS = { completed:'fa-check-circle text-green-500', failed:'fa-times-circle text-red-400', summarizing:'fa-spinner fa-spin text-pink-400', extracting:'fa-spinner fa-spin text-blue-400', asr_recognizing:'fa-spinner fa-spin text-indigo-400', pending:'fa-clock text-amber-400' };
+const STATUS_LABELS = { pending:'待处理', queued:'排队中', extracting:'提取字幕中', asr_recognizing:'语音识别中', summarizing:'总结生成中', completed:'已完成', failed:'失败' };
+const STATUS_CLASSES = { pending:'status-pending', queued:'status-queued', extracting:'status-extracting', asr_recognizing:'status-asr_recognizing', summarizing:'status-summarizing', completed:'status-completed', failed:'status-failed' };
+const STATUS_ICONS = { completed:'fa-check-circle text-green-500', failed:'fa-times-circle text-red-400', summarizing:'fa-spinner fa-spin text-pink-400', extracting:'fa-spinner fa-spin text-blue-400', asr_recognizing:'fa-spinner fa-spin text-indigo-400', pending:'fa-clock text-amber-400', queued:'fa-hourglass-half text-violet-400' };
 
 // ===================== State =====================
 let jobs = [];
@@ -657,11 +658,11 @@ function renderDetail(job){
   if(job.thumbnail){ thumb.classList.remove('hidden'); thumbImg.src=job.thumbnail; } else { thumb.classList.add('hidden'); }
   const progressInline=document.getElementById('progressInline');
   const completedHint=document.getElementById('detailCompletedHint');
-  const isProcessing=['pending','extracting','asr_recognizing','summarizing'].includes(job.status);
+  const isProcessing=['pending','queued','extracting','asr_recognizing','summarizing'].includes(job.status);
   if(isProcessing){
     progressInline.classList.remove('hidden'); progressInline.classList.add('flex');
     completedHint.classList.add('hidden');
-    const progress={pending:5,extracting:25,asr_recognizing:55,summarizing:85}[job.status]||0;
+    const progress={queued:2,pending:5,extracting:25,asr_recognizing:55,summarizing:85}[job.status]||0;
     document.getElementById('progressBar').style.width=`${progress}%`;
     document.getElementById('progressPercent').textContent=`${progress}%`;
   } else {
@@ -684,18 +685,29 @@ function renderDetail(job){
   else if(job.summary){ sl.classList.add('hidden'); sc.classList.remove('hidden'); se.classList.add('hidden'); sc.innerHTML = (typeof marked !== 'undefined') ? marked.parse(job.summary, {breaks:true}) : job.summary; }
   else { sl.classList.add('hidden'); sc.classList.add('hidden'); se.classList.remove('hidden'); }
   const tt=document.getElementById('transcriptText');
-  const transcriptLoading=job.status==='extracting'||job.status==='asr_recognizing';
-  if(transcriptLoading){ tt.innerHTML='<span class="text-slate-500 flex items-center gap-2"><i class="fas fa-spinner fa-spin text-slate-400 text-xs"></i> 提取字幕中...</span>'; }
-  else { tt.textContent=job.transcript||'暂无字幕内容'; }
+  const isFreshExtracting=job.status==='extracting'||job.status==='asr_recognizing';
+  // retry_asr 时旧 transcript 保留可见，仅在 ASR 真的覆盖后才更新（后端用 _on_retry 写 error 字段做重试进度反馈）
+  const retryMatch=job.error && /第\s*(\d+)\/(\d+)\s*次重试/.exec(job.error);
+  if(isFreshExtracting && !job.transcript){
+    // 没有旧字幕 → 显示 spinner loading
+    tt.innerHTML='<span class="text-slate-500 flex items-center gap-2"><i class="fas fa-spinner fa-spin text-slate-400 text-xs"></i> 提取字幕中...</span>';
+  } else if(retryMatch){
+    // ASR 正在重试中（无论有无旧字幕）→ 在内容上叠加顶部进度条
+    const safeText=job.transcript || '暂无字幕内容';
+    const safeTextEsc=safeText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    tt.innerHTML=`<div class="mb-2 px-2 py-1.5 rounded bg-amber-50 border border-amber-200 text-amber-700 text-xs flex items-center gap-2"><i class="fas fa-spinner fa-spin"></i> ASR 连接失败，正在第 ${retryMatch[1]}/${retryMatch[2]} 次重试…</div><div>${safeTextEsc}</div>`;
+  } else {
+    tt.textContent=job.transcript||'暂无字幕内容';
+  }
   document.getElementById('transcriptMeta').textContent=job.transcript?`(${job.transcript.length} 字)`:'';
   const menuCopyTranscript=document.getElementById('menuCopyTranscript');
   if(menuCopyTranscript) menuCopyTranscript.classList.toggle('hidden',!job.transcript);
   // 字幕卡片：复制 / 重新识别 按钮切换
   const btnCopyTranscript=document.getElementById('btnCopyTranscript');
   const btnRetryAsr=document.getElementById('btnRetryAsr');
-  const canRetryAsr = (job.status==='failed' || job.status==='asr_recognizing') && job.audio_path && !job.transcript;
+  const canRetryAsr = (job.status==='failed' || job.status==='asr_recognizing') && job.audio_path && !job.transcript && !isProcessing;
   if(btnCopyTranscript) btnCopyTranscript.classList.toggle('hidden', canRetryAsr);
-  if(btnRetryAsr) btnRetryAsr.classList.toggle('hidden', !canRetryAsr);
+  if(btnRetryAsr){ btnRetryAsr.classList.toggle('hidden', !canRetryAsr); btnRetryAsr.disabled=isProcessing; }
   const retryBtn=document.getElementById('summaryRetryBtn');
   if(retryBtn) retryBtn.classList.toggle('hidden',job.status!=='failed');
 }

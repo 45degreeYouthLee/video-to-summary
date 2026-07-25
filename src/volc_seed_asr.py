@@ -283,7 +283,8 @@ class VolcSeedASRClient:
         estimated = int(duration_sec * self.timeout_audio_multiplier) + self.timeout_buffer_seconds
         return max(self.timeout_min_seconds, estimated)
 
-    def transcribe(self, audio_path: Path) -> str:
+    def transcribe(self, audio_path: Path, on_retry=None) -> str:
+        """火山 SeedASR 同步入口；on_retry 目前不用于 WebSocket 模式，但保留兼容接口。"""
         audio_path = Path(audio_path)
         print(f"[ASR] 开始提交音频到火山 SeedASR: {audio_path}", flush=True)
         print(f"[ASR] 接口: {self.url} (nonstream={self.enable_nonstream}, realtime={self.simulate_realtime})", flush=True)

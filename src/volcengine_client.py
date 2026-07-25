@@ -13,6 +13,20 @@ import yaml
 from openai import OpenAI
 
 
+def _fill_template(user_template: str, transcript: str, meta: dict | None = None) -> str:
+    """
+    替换 user prompt 模板中的占位符：
+      {transcript} 必填
+      {title} / {uploader} / {duration} 可选（meta 为 None 或字段缺失时填空字符串）
+    """
+    content = user_template.replace("{transcript}", transcript)
+    if meta:
+        for key in ("title", "uploader", "duration"):
+            value = meta.get(key)
+            content = content.replace("{" + key + "}", str(value) if value else "")
+    return content
+
+
 class VolcengineClient:
     def __init__(self, api_key: str, base_url: str, model: str):
         self.client = OpenAI(
@@ -28,13 +42,15 @@ class VolcengineClient:
         user_template: str,
         max_tokens: int = 2048,
         temperature: float = 0.3,
+        meta: dict | None = None,
     ) -> str:
         """
         调用火山方舟模型生成总结
         transcript: 清洗后的字幕全文
         user_template: 需包含 {transcript} 占位符
+        meta: 可选，注入 {title}/{uploader}/{duration} 占位符
         """
-        user_content = user_template.replace("{transcript}", transcript)
+        user_content = _fill_template(user_template, transcript, meta)
 
         # 火山方舟兼容 OpenAI 接口格式
         messages = [
@@ -102,11 +118,13 @@ class MimoChatClient:
         user_template: str,
         max_tokens: int = 2048,
         temperature: float = 0.3,
+        meta: dict | None = None,
     ) -> str:
         """
         调用 MiMo 模型生成总结
+        meta: 可选，注入 {title}/{uploader}/{duration} 占位符
         """
-        user_content = user_template.replace("{transcript}", transcript)
+        user_content = _fill_template(user_template, transcript, meta)
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -161,11 +179,11 @@ class MimoASRClient:
             self.api_url = f"{self.api_url}/chat/completions"
         self.language = language
 
-    def transcribe(self, audio_path: Path, max_retries: int = 3) -> str:
+    def transcribe(self, audio_path: Path, max_retries: int = 3, on_retry=None) -> str:
         """
         上传音频文件并返回识别文本。
         支持 mp3 / wav 格式。
-        遇到网络错误自动重试。
+        遇到网络错误自动重试；on_retry(attempt, max_attempts, error) 用于向调用方反馈重试进度。
         """
         audio_path = Path(audio_path)
         suffix = audio_path.suffix.lower()
@@ -231,6 +249,11 @@ class MimoASRClient:
 
             except requests.exceptions.ConnectionError as e:
                 last_error = e
+                if on_retry:
+                    try:
+                        on_retry(attempt, max_retries, e)
+                    except Exception:
+                        pass
                 print(f"[警告] MiMo ASR 连接失败，第 {attempt}/{max_retries} 次重试...")
                 if attempt < max_retries:
                     time.sleep(2 ** attempt)  # 指数退避
@@ -272,8 +295,9 @@ class GenericChatClient:
         user_template: str,
         max_tokens: int = 2048,
         temperature: float = 0.3,
+        meta: dict | None = None,
     ) -> str:
-        user_content = user_template.replace("{transcript}", transcript)
+        user_content = _fill_template(user_template, transcript, meta)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -302,7 +326,8 @@ class GenericASRClient:
         if not self.api_url.endswith("/chat/completions"):
             self.api_url = f"{self.api_url}/chat/completions"
 
-    def transcribe(self, audio_path: Path, max_retries: int = 3) -> str:
+    def transcribe(self, audio_path: Path, max_retries: int = 3, on_retry=None) -> str:
+        """通用 OpenAI 兼容 ASR；on_retry(attempt, max_attempts, error) 用于反馈重试进度。"""
         audio_path = Path(audio_path)
         suffix = audio_path.suffix.lower()
         if suffix == ".mp3":
@@ -358,6 +383,11 @@ class GenericASRClient:
                 return text
             except requests.exceptions.ConnectionError as e:
                 last_error = e
+                if on_retry:
+                    try:
+                        on_retry(attempt, max_retries, e)
+                    except Exception:
+                        pass
                 print(f"[警告] ASR 连接失败，第 {attempt}/{max_retries} 次重试...")
                 if attempt < max_retries:
                     time.sleep(2 ** attempt)

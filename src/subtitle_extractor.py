@@ -12,6 +12,26 @@ import tempfile
 from pathlib import Path
 
 
+
+def _normalize_bili_url(url: str) -> str:
+    """把 BV/av 号或 B站列表 URL 归一化为标准视频 URL"""
+    url = url.strip()
+    if re.match(r"^(BV[a-zA-Z0-9]+)$", url, re.IGNORECASE):
+        return f"https://www.bilibili.com/video/{url}"
+    if re.match(r"^(av\d+)$", url, re.IGNORECASE):
+        return f"https://www.bilibili.com/video/{url}"
+    if re.match(r"^https?://(www\.)?bilibili\.com/(list|watchlater)/", url, re.IGNORECASE):
+        m_bvid = re.search(r"[?&]bvid=(BV[a-zA-Z0-9]+)", url, re.IGNORECASE)
+        if m_bvid:
+            return f"https://www.bilibili.com/video/{m_bvid.group(1)}"
+        m_av = re.search(r"[?&]av=(av\d+)", url, re.IGNORECASE)
+        if m_av:
+            return f"https://www.bilibili.com/video/{m_av.group(1)}"
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        return f"https://{url}"
+    return url
+
+
 class SubtitleExtractor:
     def __init__(self, yt_dlp_path="yt-dlp", temp_dir="./temp", cookies_options: dict | None = None):
         self.yt_dlp_path = yt_dlp_path
@@ -89,7 +109,7 @@ class SubtitleExtractor:
         except (subprocess.CalledProcessError, FileNotFoundError):
             raise RuntimeError(
                 f"yt-dlp 未找到: {self.yt_dlp_path}\n"
-                "请安装: .\\venv\\Scripts\\pip install yt-dlp"
+                r"请安装: .\venv\Scripts\pip install yt-dlp"
             )
 
     def get_video_info(self, url: str) -> dict:
@@ -99,6 +119,7 @@ class SubtitleExtractor:
             "--dump-json",
             "--skip-download",
             "--no-warnings",
+            "--no-playlist",
             url,
         ])
         print(f"[调试] 获取视频信息命令: {' '.join(cmd)}")
@@ -161,6 +182,7 @@ class SubtitleExtractor:
             "--list-subs",
             "--dump-json",
             "--skip-download",
+            "--no-playlist",
             url,
         ])
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -189,6 +211,7 @@ class SubtitleExtractor:
             "--sub-langs", lang,
             "--convert-subs", ext,
             "--skip-download",
+            "--no-playlist",
             "--paths", str(self.temp_dir),
             "--output", str(outtmpl),
             url,
@@ -201,7 +224,7 @@ class SubtitleExtractor:
             return files[-1]
         return None
 
-    def extract_audio(self, url: str) -> Path:
+    def extract_audio(self, url: str, video_id: str | None = None) -> Path:
         """
         使用 yt-dlp Python API 提取音频，更可控、错误信息更完整。
         返回 mp3 文件路径。
@@ -216,12 +239,23 @@ class SubtitleExtractor:
             if d["status"] == "finished":
                 output_path = d.get("filename")
 
-        # 不再清理旧音频：失败重试（retry-asr）需要依赖历史音频文件。
-        # 后续按修改时间取最新 audio_* 文件即可，避免混淆。
+        # 按 video_id 隔离音频文件，避免多任务/失败重试时拿错音频。
+        # 若 video_id 缺失则回退到 yt-dlp 的 %(id)s。
+        audio_id = video_id or "%(id)s"
+        outtmpl = str(self.temp_dir / f"audio_{audio_id}.%(ext)s")
+
+        # 开始前清理该 video_id 的旧音频文件（避免 mtime 干扰）
+        if video_id:
+            for old_audio in self.temp_dir.glob(f"audio_{video_id}*"):
+                try:
+                    old_audio.unlink()
+                    print(f"[清理] 删除旧音频: {old_audio}")
+                except Exception as e:
+                    print(f"[警告] 删除旧音频失败: {old_audio}: {e}")
 
         ydl_opts = {
             "format": "ba",
-            "outtmpl": str(self.temp_dir / "audio_%(id)s.%(ext)s"),
+            "outtmpl": outtmpl,
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -233,6 +267,12 @@ class SubtitleExtractor:
             "no_warnings": False,
             "progress_hooks": [progress_hook],
             "noprogress": True,
+            # 禁用断点续传，避免上次下载残留的部分 m4a 导致 Resume 后得到截断音频
+            "continuedl": False,
+            "retries": 10,
+            "fragment_retries": 10,
+            "socket_timeout": 60,
+            "noplaylist": True,
         }
         ydl_opts = self._apply_cookies_to_ydl(ydl_opts)
 
@@ -247,11 +287,16 @@ class SubtitleExtractor:
             try:
                 ydl_opts_m4a = {
                     "format": "ba[ext=m4a]/ba",
-                    "outtmpl": str(self.temp_dir / "audio_%(id)s.%(ext)s"),
+                    "outtmpl": outtmpl,
                     "quiet": False,
                     "no_warnings": False,
                     "progress_hooks": [progress_hook],
                     "noprogress": True,
+                    "continuedl": False,
+                    "retries": 10,
+                    "fragment_retries": 10,
+                    "socket_timeout": 60,
+                    "noplaylist": True,
                 }
                 ydl_opts_m4a = self._apply_cookies_to_ydl(ydl_opts_m4a)
                 with yt_dlp.YoutubeDL(ydl_opts_m4a) as ydl:
@@ -259,12 +304,19 @@ class SubtitleExtractor:
             except Exception as e:
                 errors.append(str(e))
 
-        # 查找下载到的文件
-        files = sorted(
-            self.temp_dir.glob("audio_*.*"),
-            key=os.path.getmtime,
-            reverse=True,
-        )
+        # 查找下载到的文件（按 video_id 精确匹配）
+        if video_id:
+            files = sorted(
+                self.temp_dir.glob(f"audio_{video_id}*"),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+        else:
+            files = sorted(
+                self.temp_dir.glob("audio_*.*"),
+                key=os.path.getmtime,
+                reverse=True,
+            )
 
         if not files:
             raise RuntimeError(
@@ -272,7 +324,8 @@ class SubtitleExtractor:
                 "可能原因：\n"
                 "1. B站视频需要登录 cookie（可在 config.yaml 配置 bilibili.cookies）\n"
                 "2. 视频受地区/版权限制\n"
-                "3. yt-dlp 版本过旧，尝试执行: .\\venv\\Scripts\\pip install -U yt-dlp\n"
+                r"3. yt-dlp 版本过旧，尝试执行: .\venv\Scripts\pip install -U yt-dlp"
+                "\n"
                 f"错误详情: {'; '.join(errors[:3])}"
             )
 
@@ -484,6 +537,7 @@ def extract_transcript(url: str, config: dict, force_audio: bool = False) -> tup
     source_info: 'subtitle' 或 'audio' 或 'failed'
     force_audio: 为 True 时跳过字幕，直接提取音频（用于强制 ASR）
     """
+    url = _normalize_bili_url(url)
     extractor = SubtitleExtractor(
         yt_dlp_path=config["paths"]["yt_dlp_path"],
         temp_dir=config["paths"]["temp_dir"],

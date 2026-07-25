@@ -13,6 +13,7 @@ import http.cookiejar as cookiejar
 import json
 import math
 import os
+import queue
 import re
 import sqlite3
 import sys
@@ -38,6 +39,28 @@ from volc_seed_asr import VolcSeedASRClient
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app)
+
+# ===================== 全局串行任务队列 =====================
+job_queue = queue.Queue()
+
+
+def _job_worker():
+    """后台单线程工作线程，串行处理所有任务，避免并发导致的音频/资源冲突"""
+    while True:
+        item = job_queue.get()
+        try:
+            args = item.get("args", ())
+            kwargs = item.get("kwargs", {})
+            process_job(*args, **kwargs)
+        except Exception as e:
+            print(f"[队列] 任务执行异常: {e}")
+        finally:
+            job_queue.task_done()
+
+
+_job_worker_thread = threading.Thread(target=_job_worker, daemon=True)
+_job_worker_thread.start()
+
 
 # ===================== 配置 =====================
 CONFIG_PATH = Path("config.yaml")
@@ -155,6 +178,7 @@ def _summarize_long_transcript(
     transcript: str,
     config: dict,
     max_context_tokens: int,
+    meta: dict | None = None,
 ):
     """
     分段总结：超长字幕拆分为多个片段，分别总结后合并为最终总结。
@@ -197,6 +221,7 @@ def _summarize_long_transcript(
         user_template=final_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
+        meta=meta,
     )
 
 
@@ -262,7 +287,7 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
                 resume_from = "start"
             else:
                 print(f"[信息] 使用已保存音频重新进行 ASR: {existing_audio_path}")
-                transcript, source = _run_asr(existing_audio_path, job_id, config, conn)
+                transcript, source = _run_asr(existing_audio_path, job_id, config, conn, video_id=video_id)
         
         if resume_from == "start" and not transcript:
             # 阶段 1：尝试提取 CC 字幕
@@ -297,30 +322,29 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
                 )
                 conn.commit()
 
-                # 找到最新提取的音频文件
+                # 按 video_id 精确提取音频，避免 temp 目录旧文件干扰
                 temp_dir = Path(config["paths"]["temp_dir"])
-                audio_files = sorted(
-                    temp_dir.glob("audio_*.*"),
-                    key=os.path.getmtime,
-                    reverse=True,
-                )
-                if not audio_files:
-                    raise RuntimeError(
-                        "音频提取失败，无法找到音频文件。\n"
-                        "常见原因：\n"
-                        "1. 未安装 ffmpeg（音频转码需要）\n"
-                        "2. B站视频需要登录 cookie 才能下载\n"
-                        "3. 视频本身受地区/版权限制"
-                    )
-
-                audio_path = str(audio_files[0])
+                # 如果音频时长明显短于视频，重试一次（常见原因是断点续传残留/网络中断）
+                max_audio_attempts = 2
+                audio_path_obj = None
+                expected_duration = video_info.get("duration") or 0
+                for audio_attempt in range(1, max_audio_attempts + 1):
+                    audio_path_obj = extractor.extract_audio(url, video_id=video_id)
+                    audio_path = str(audio_path_obj)
+                    audio_duration = _get_audio_duration(audio_path)
+                    if expected_duration and audio_duration < expected_duration * 0.8:
+                        print(f"[警告] 提取音频时长 {audio_duration:.1f}s 明显短于视频 {expected_duration:.1f}s，"
+                              f"第 {audio_attempt}/{max_audio_attempts} 次重试...")
+                        if audio_attempt < max_audio_attempts:
+                            continue
+                    break
                 conn.execute(
                     "UPDATE jobs SET audio_path=?, updated_at=? WHERE id=?",
-                    (audio_path, datetime.now().isoformat(), job_id),
+                    (str(audio_path_obj), datetime.now().isoformat(), job_id),
                 )
                 conn.commit()
 
-                transcript, source = _run_asr(audio_path, job_id, config, conn)
+                transcript, source = _run_asr(audio_path, job_id, config, conn, video_id=video_id)
 
         if not transcript or not transcript.strip():
             raise RuntimeError("未获取到任何文本内容，无法进行总结")
@@ -328,7 +352,7 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
         # 阶段 3：调用 LLM 总结
         now = datetime.now().isoformat()
         conn.execute(
-            "UPDATE jobs SET transcript=?, source=?, status=?, updated_at=? WHERE id=?",
+            "UPDATE jobs SET transcript=?, source=?, status=?, error=NULL, updated_at=? WHERE id=?",
             (transcript, source, "summarizing", now, job_id),
         )
         conn.commit()
@@ -347,9 +371,15 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
         # 判断是否需要分段总结
         transcript_tokens = _estimate_tokens(transcript)
         max_context_tokens = summary_cfg.get("max_context_tokens", 6000)
+        # 注入 {title}/{uploader}/{duration} 占位符
+        summary_meta = {
+            "title": video_info.get("title", ""),
+            "uploader": video_info.get("uploader", ""),
+            "duration": video_info.get("duration"),
+        }
         if transcript_tokens > max_context_tokens:
             summary = _summarize_long_transcript(
-                client, transcript, config, max_context_tokens
+                client, transcript, config, max_context_tokens, meta=summary_meta
             )
         else:
             summary = client.summarize(
@@ -358,6 +388,7 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
                 user_template=config["summary_prompt"]["user_prompt_template"],
                 max_tokens=config["summary_prompt"]["max_tokens"],
                 temperature=config["summary_prompt"]["temperature"],
+                meta=summary_meta,
             )
 
         # 完成
@@ -423,8 +454,10 @@ def _compress_audio(audio_path: Path, duration_sec: float) -> Path:
         return audio_path
 
 
-def _transcribe_single(audio_path: Path, config: dict) -> str:
-    """发送单个音频文件给 ASR，返回识别文本"""
+def _transcribe_single(audio_path: Path, config: dict, on_retry=None) -> str:
+    """发送单个音频文件给 ASR，返回识别文本
+    on_retry: 失败重试时的回调，签名为 fn(attempt, max_attempts, error)
+    """
     asr_cfg = config.get("asr", {})
     asr_base_url = asr_cfg.get("base_url", "https://token-plan-cn.xiaomimimo.com/v1")
     print(f"[ASR] 调用 ASR 客户端: {asr_base_url}", flush=True)
@@ -447,41 +480,82 @@ def _transcribe_single(audio_path: Path, config: dict) -> str:
             model=asr_cfg.get("model", "mimo-v2.5-asr"),
             language=asr_cfg.get("language", "auto"),
         )
-    return asr.transcribe(audio_path)
+    return asr.transcribe(audio_path, on_retry=on_retry)
 
 
-def _split_and_transcribe(audio_path: Path, duration_sec: float, config: dict) -> tuple[str, str]:
-    """超长音频（>=120分钟）：切成 20 分钟一段，逐段 ASR，再组装。
-
-    每段带 30 秒前后重叠防止切口处丢字，
-    最终用去重函数处理重叠区域。
+def _split_and_transcribe(audio_path: Path, duration_sec: float, config: dict, video_id: str = "", on_retry=None) -> tuple[str, str]:
     """
-    CHUNK_MINUTES = 20
-    OVERLAP = 30  # 秒
+    超长音频：切成小块逐段 ASR，再组装。
+
+    默认 2 分钟一块，相邻段带 10 秒重叠防切口处丢字。
+    mimo-v2.5-asr 等 OpenAI 兼容 ASR 对 audio input 时长有 ~1-2 分钟上限，
+    切太大会被服务端截断（实测 12 分钟音频只返回前 6 秒识别结果）。
+
+    video_id 用于分片文件命名隔离。
+    """
+    CHUNK_MINUTES = config.get("asr", {}).get("chunk_minutes", 2)
+    OVERLAP = 10  # 秒
     chunk_sec = CHUNK_MINUTES * 60
     total_chunks = math.ceil(duration_sec / chunk_sec)
 
+    # 分片文件前缀加入 video_id，避免多任务串行时文件名冲突
+    chunk_prefix = f"chunk_{video_id}_" if video_id else "chunk_"
+
     all_texts = []
     for i in range(total_chunks):
-        start = i * chunk_sec
-        end = min(start + chunk_sec + OVERLAP, duration_sec)
+        start_t = i * chunk_sec
+        end_t = min(start_t + chunk_sec + OVERLAP, duration_sec)
         if i == total_chunks - 1:
-            end = duration_sec  # 最后一段不要尾部重叠
+            end_t = duration_sec  # 最后一段不要尾部重叠
 
-        chunk_path = audio_path.with_name(f"chunk_{i:03d}{audio_path.suffix}")
+        chunk_path = audio_path.with_name(f"{chunk_prefix}{i:03d}{audio_path.suffix}")
         try:
             # 切段 + 一步压缩到 16kbps
             subprocess.run([
                 "ffmpeg", "-y", "-i", str(audio_path),
-                "-ss", str(start), "-to", str(end),
+                "-ss", str(start_t), "-to", str(end_t),
                 "-ac", "1", "-ar", "16000", "-b:a", "16k",
                 "-map", "0:a", str(chunk_path),
             ], check=True, capture_output=True, timeout=120)
 
-            print(f"[分片] ({i+1}/{total_chunks}) {start//60}-{int(end)//60} 分, "
+            print(f"[分片] ({i+1}/{total_chunks}) {start_t//60}-{int(end_t)//60} 分, "
                   f"{chunk_path.stat().st_size/1024:.0f}KB, 正在 ASR...")
 
-            text = _transcribe_single(chunk_path, config)
+            text = _transcribe_single(chunk_path, config, on_retry=on_retry)
+            chunk_dur = end_t - start_t
+
+            # 兜底：若某段返回字数异常少（< 0.5 字/秒，说明服务端又把整段截断），
+            # 切更细（按 1 分钟）逐段 ASR 后拼接
+            if text and len(text) < chunk_dur * 0.5:
+                print(f"[分片] ({i+1}/{total_chunks}) 字数过少 ({len(text)} 字 / {chunk_dur:.0f} 秒)，"
+                      f"疑似服务端截断，按 1 分钟再切")
+                sub_chunk = 60  # 1 分钟
+                sub_texts = []
+                sub_start = start_t
+                while sub_start < end_t:
+                    sub_end = min(sub_start + sub_chunk, end_t)
+                    sub_path = chunk_path.with_name(f"{chunk_prefix}{i:03d}_sub_{int(sub_start)}{audio_path.suffix}")
+                    try:
+                        subprocess.run([
+                            "ffmpeg", "-y", "-i", str(audio_path),
+                            "-ss", str(sub_start), "-to", str(sub_end),
+                            "-ac", "1", "-ar", "16000", "-b:a", "16k",
+                            "-map", "0:a", str(sub_path),
+                        ], check=True, capture_output=True, timeout=120)
+                        st = _transcribe_single(sub_path, config, on_retry=on_retry)
+                        sub_texts.append(st)
+                        print(f"[分片]   sub {sub_start:.0f}-{sub_end:.0f}s 识别 {len(st)} 字")
+                    except Exception as e:
+                        print(f"[分片]   sub {sub_start:.0f}-{sub_end:.0f}s 失败: {e}")
+                        sub_texts.append("")
+                    finally:
+                        try:
+                            sub_path.unlink()
+                        except Exception:
+                            pass
+                    sub_start = sub_end
+                text = SubtitleExtractor.deduplicate_asr_text("\n".join(t for t in sub_texts if t))
+
             all_texts.append(text)
             print(f"[分片] ({i+1}/{total_chunks}) 完成，识别 {len(text)} 字")
 
@@ -502,28 +576,43 @@ def _split_and_transcribe(audio_path: Path, duration_sec: float, config: dict) -
     return transcript, "audio_asr"
 
 
-def _run_asr(audio_path: str, job_id: str, config: dict, conn) -> tuple[str, str]:
-    """执行 ASR 识别，含动态音频压缩 + 超长分片，返回 (transcript, source)"""
+def _run_asr(audio_path: str, job_id: str, config: dict, conn, video_id: str = "") -> tuple[str, str]:
+    """执行 ASR 识别，含动态音频压缩 + 超长分片，返回 (transcript, source)
+
+    on_retry 回调会把重试进度写入 jobs.error，让前端轮询时有反馈。
+    """
     audio_file = Path(audio_path)
     orig_size_kb = audio_file.stat().st_size / 1024
     asr_cfg = config.get("asr", {})
+
+    def _on_retry(attempt, max_attempts, error):
+        msg = f"[ASR重试] 第 {attempt}/{max_attempts} 次连接重试: {error}"
+        print(msg)
+        try:
+            conn.execute(
+                "UPDATE jobs SET error=?, updated_at=? WHERE id=?",
+                (msg, datetime.now().isoformat(), job_id),
+            )
+            conn.commit()
+        except Exception as db_err:
+            print(f"[警告] 写入重试状态到数据库失败: {db_err}")
 
     # 获取音频时长
     duration = _get_audio_duration(str(audio_file))
     print(f"[信息] 音频: {audio_file.name}, {orig_size_kb:.0f}KB, 时长 {duration/60:.1f} 分钟")
 
     # 策略选择
-    split_threshold_min = asr_cfg.get("split_threshold_minutes", 10)
+    split_threshold_min = asr_cfg.get("split_threshold_minutes", 2)
     split_threshold_sec = split_threshold_min * 60
     if duration >= split_threshold_sec:
         print(f"[信息] 音频时长 {duration/60:.1f} 分钟，超过 {split_threshold_min} 分钟阈值，启用分片 ASR")
-        return _split_and_transcribe(audio_file, duration, config)
+        return _split_and_transcribe(audio_file, duration, config, video_id=video_id, on_retry=_on_retry)
 
     # < 阈值 → 压缩后单次 ASR
     print(f"[信息] 音频时长 {duration/60:.1f} 分钟，未超过分片阈值，单次 ASR")
     compressed = _compress_audio(audio_file, duration)
     try:
-        transcript = _transcribe_single(compressed, config)
+        transcript = _transcribe_single(compressed, config, on_retry=_on_retry)
     finally:
         if compressed != audio_file:
             try:
@@ -542,9 +631,17 @@ def _run_asr(audio_path: str, job_id: str, config: dict, conn) -> tuple[str, str
 
 
 def _get_video_id(url: str) -> str:
+    # 优先从路径取 BV/av
     match = re.search(r"/(BV\w+|av\d+)", url)
     if match:
         return match.group(1)
+    # 列表/稍后再看 URL 的参数
+    m_bvid = re.search(r"[?&]bvid=(BV[a-zA-Z0-9]+)", url, re.IGNORECASE)
+    if m_bvid:
+        return m_bvid.group(1)
+    m_av = re.search(r"[?&]av=(av\d+)", url, re.IGNORECASE)
+    if m_av:
+        return m_av.group(1)
     return hashlib.md5(url.encode()).hexdigest()[:8]
 
 
@@ -632,12 +729,21 @@ def list_jobs():
 
 
 def _normalize_bili_url(url: str) -> str:
-    """把 BV/av 号补全成完整 B站视频 URL"""
+    """把 BV/av 号或 B站列表 URL 归一化为标准视频 URL"""
     url = url.strip()
+    # 纯 BV/av 号
     if re.match(r"^(BV[a-zA-Z0-9]+)$", url, re.IGNORECASE):
         return f"https://www.bilibili.com/video/{url}"
     if re.match(r"^(av\d+)$", url, re.IGNORECASE):
         return f"https://www.bilibili.com/video/{url}"
+    # 列表/稍后再看 URL：提取 bvid/av 参数，转标准视频 URL
+    if re.match(r"^https?://(www\.)?bilibili\.com/(list|watchlater)/", url, re.IGNORECASE):
+        m_bvid = re.search(r"[?&]bvid=(BV[a-zA-Z0-9]+)", url, re.IGNORECASE)
+        if m_bvid:
+            return f"https://www.bilibili.com/video/{m_bvid.group(1)}"
+        m_av = re.search(r"[?&]av=(av\d+)", url, re.IGNORECASE)
+        if m_av:
+            return f"https://www.bilibili.com/video/{m_av.group(1)}"
     if not re.match(r"^https?://", url, re.IGNORECASE):
         return f"https://{url}"
     return url
@@ -671,9 +777,8 @@ def create_job():
     conn.commit()
     conn.close()
 
-    # 后台启动处理
-    thread = threading.Thread(target=process_job, args=(job_id, url, force_asr), daemon=True)
-    thread.start()
+    # 加入全局串行队列
+    job_queue.put({"args": (job_id, url, force_asr), "kwargs": {}})
 
     return jsonify({"id": job_id, "status": "pending"})
 
@@ -721,14 +826,14 @@ def retry_job(job_id):
     conn.commit()
     conn.close()
 
-    thread = threading.Thread(target=process_job, args=(job_id, url), daemon=True)
-    thread.start()
+    job_queue.put({"args": (job_id, url), "kwargs": {}})
     return jsonify({"id": job_id, "status": "pending"})
 
 
 @app.route("/api/jobs/<job_id>/retry-asr", methods=["POST"])
 def retry_asr(job_id):
-    """使用已保存的音频重新进行 ASR，不重新下载视频/字幕"""
+    """使用已保存的音频重新进行 ASR，不重新下载视频/字幕。
+    如果音频文件缺失或与当前视频的 video_id 不匹配，则降级为从头开始重新提取音频。"""
     print(f"[API] 收到重新识别请求: job_id={job_id}", flush=True)
     conn = db_conn()
     row = conn.execute(
@@ -740,10 +845,7 @@ def retry_asr(job_id):
 
     url = row["url"]
     audio_path = row["audio_path"]
-    if not audio_path or not Path(audio_path).exists():
-        conn.close()
-        return jsonify({"error": "未找到已保存的音频文件，无法重新识别"}), 400
-
+    video_id = _get_video_id(url)
     config = load_config()
     asr_cfg = config.get("asr", {})
     asr_key = asr_cfg.get("api_key", "")
@@ -752,20 +854,27 @@ def retry_asr(job_id):
         return jsonify({"error": "ASR API Key 未配置，请在设置页填写"}), 400
 
     now = datetime.now().isoformat()
+    audio_ok = audio_path and Path(audio_path).exists() and video_id in Path(audio_path).name
+    if not audio_ok:
+        print(f"[API] audio_path 不可用或 mismatch: {audio_path}，降级为从头开始", flush=True)
+        conn.execute(
+            "UPDATE jobs SET status=?, error=NULL, audio_path=NULL, updated_at=? WHERE id=?",
+            ("pending", now, job_id),
+        )
+        conn.commit()
+        conn.close()
+        job_queue.put({"args": (job_id, url), "kwargs": {}})
+        return jsonify({"id": job_id, "status": "pending"})
+
+    # 不清理旧字幕：ASR 成功后会覆盖；失败时保留旧字幕便于排查
     conn.execute(
-        "UPDATE jobs SET status=?, error=NULL, transcript=?, source=?, updated_at=? WHERE id=?",
-        ("asr_recognizing", "", "", now, job_id),
+        "UPDATE jobs SET status=?, error=NULL, updated_at=? WHERE id=?",
+        ("asr_recognizing", now, job_id),
     )
     conn.commit()
     conn.close()
 
-    thread = threading.Thread(
-        target=process_job,
-        args=(job_id, url),
-        kwargs={"resume_from": "asr"},
-        daemon=True,
-    )
-    thread.start()
+    job_queue.put({"args": (job_id, url), "kwargs": {"resume_from": "asr"}})
     return jsonify({"id": job_id, "status": "asr_recognizing"})
 
 
@@ -1187,12 +1296,9 @@ def create_jobs_batch():
     if not created:
         return jsonify({"error": "没有有效的视频"}), 400
 
-    # 后台串行处理
-    threading.Thread(
-        target=_process_batch_sequential,
-        args=([c["id"] for c in created], force_asr),
-        daemon=True,
-    ).start()
+    # 加入全局串行队列，保证顺序执行且避免并发资源冲突
+    for c in created:
+        job_queue.put({"args": (c["id"], c["url"], force_asr), "kwargs": {}})
 
     return jsonify({"jobs": created, "total": len(created)})
 

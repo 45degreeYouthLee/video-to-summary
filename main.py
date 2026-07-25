@@ -48,16 +48,42 @@ def sanitize_filename(text: str) -> str:
 
 
 def get_video_id(url: str) -> str:
-    """从 B 站 URL 提取 BV/AV 号"""
+    """从 B 站 URL 提取 BV/AV 号（支持标准视频页和 list/watchlater 参数）"""
     match = re.search(r"/(BV\w+|av\d+)", url)
     if match:
         return match.group(1)
+    m_bvid = re.search(r"[?&]bvid=(BV[a-zA-Z0-9]+)", url, re.IGNORECASE)
+    if m_bvid:
+        return m_bvid.group(1)
+    m_av = re.search(r"[?&]av=(av\d+)", url, re.IGNORECASE)
+    if m_av:
+        return m_av.group(1)
     # 兜底用 URL hash
     return hashlib.md5(url.encode()).hexdigest()[:8]
 
 
+def normalize_bili_url(url: str) -> str:
+    """把 BV/av 号或 B站列表 URL 归一化为标准视频 URL"""
+    url = url.strip()
+    if re.match(r"^(BV[a-zA-Z0-9]+)$", url, re.IGNORECASE):
+        return f"https://www.bilibili.com/video/{url}"
+    if re.match(r"^(av\d+)$", url, re.IGNORECASE):
+        return f"https://www.bilibili.com/video/{url}"
+    if re.match(r"^https?://(www\.)?bilibili\.com/(list|watchlater)/", url, re.IGNORECASE):
+        m_bvid = re.search(r"[?&]bvid=(BV[a-zA-Z0-9]+)", url, re.IGNORECASE)
+        if m_bvid:
+            return f"https://www.bilibili.com/video/{m_bvid.group(1)}"
+        m_av = re.search(r"[?&]av=(av\d+)", url, re.IGNORECASE)
+        if m_av:
+            return f"https://www.bilibili.com/video/{m_av.group(1)}"
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        return f"https://{url}"
+    return url
+
+
 def process_single(url: str, config: dict, dry_run: bool = False) -> str:
     """处理单个视频，返回 Markdown 总结文本"""
+    url = normalize_bili_url(url)
     video_id = get_video_id(url)
     print(f"\n{'='*50}")
     print(f"[处理] {url} (ID: {video_id})")
