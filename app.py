@@ -239,48 +239,55 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
         config = load_config()
         video_id = _get_video_id(url)
 
-        # 尽早保存 video_id 和视频元信息
-        extractor = SubtitleExtractor(
-            yt_dlp_path=config["paths"]["yt_dlp_path"],
-            temp_dir=config["paths"]["temp_dir"],
-            cookies_options=config.get("bilibili", {}),
-        )
-        video_info = extractor.get_video_info(url)
-        now = datetime.now().isoformat()
-        conn.execute(
-            "UPDATE jobs SET video_id=?, title=?, thumbnail=?, description=?, uploader=?, duration=?, updated_at=? WHERE id=?",
-            (
-                video_id,
-                video_info.get("title", ""),
-                video_info.get("thumbnail", ""),
-                video_info.get("description", ""),
-                video_info.get("uploader", ""),
-                video_info.get("duration"),
-                now,
-                job_id,
-            ),
-        )
-        conn.commit()
-
-        # 检查是否已有字幕（断点续传：直接总结）
+        # 先检查已有转录；重做总结时不要求原视频仍然可访问。
         row = conn.execute(
-            "SELECT transcript, source, audio_path FROM jobs WHERE id=?", (job_id,)
+            "SELECT transcript, source, audio_path, title, uploader, duration FROM jobs WHERE id=?",
+            (job_id,),
         ).fetchone()
-        existing_transcript = row["transcript"] if row else None
-        existing_source = row["source"] if row else None
-        existing_audio_path = row["audio_path"] if row else None
+        if row is None:
+            return
+        existing_transcript = row["transcript"] or ""
+        has_existing_transcript = bool(existing_transcript.strip())
+        if resume_from == "summary" and not has_existing_transcript:
+            raise RuntimeError("没有可用的字幕，无法重新生成总结")
 
         transcript, source = "", ""
-
-        if resume_from == "summary" or (resume_from == "start" and existing_transcript and existing_transcript.strip()):
-            # 重新生成总结，或从头开始时已有字幕直接总结
-            if resume_from == "summary" and not (existing_transcript and existing_transcript.strip()):
-                raise RuntimeError("没有可用的字幕，无法重新生成总结")
-            print(f"[信息] 跳过音频提取/ASR，直接进行总结")
+        if has_existing_transcript and resume_from in ("start", "summary"):
+            print("[信息] 跳过音频提取/ASR，直接进行总结")
             transcript = existing_transcript
-            source = existing_source or "cached"
-        elif resume_from == "asr":
+            source = row["source"] or "cached"
+            video_info = {
+                "title": row["title"] or "",
+                "uploader": row["uploader"] or "",
+                "duration": row["duration"],
+            }
+        else:
+            # 提取流程保存当前视频信息，供后续总结重试复用。
+            extractor = SubtitleExtractor(
+                yt_dlp_path=config["paths"]["yt_dlp_path"],
+                temp_dir=config["paths"]["temp_dir"],
+                cookies_options=config.get("bilibili", {}),
+            )
+            video_info = extractor.get_video_info(url)
+            now = datetime.now().isoformat()
+            conn.execute(
+                "UPDATE jobs SET video_id=?, title=?, thumbnail=?, description=?, uploader=?, duration=?, updated_at=? WHERE id=?",
+                (
+                    video_id,
+                    video_info.get("title", ""),
+                    video_info.get("thumbnail", ""),
+                    video_info.get("description", ""),
+                    video_info.get("uploader", ""),
+                    video_info.get("duration"),
+                    now,
+                    job_id,
+                ),
+            )
+            conn.commit()
+
+        if resume_from == "asr":
             # 跳过字幕提取，直接用已有音频进行 ASR（会覆盖已有字幕）
+            existing_audio_path = row["audio_path"]
             if not existing_audio_path or not Path(existing_audio_path).exists():
                 # 没有可用音频，降级为从头开始
                 print("[警告] 未找到已保存音频，降级为从头开始")
@@ -394,8 +401,9 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
         # 完成
         now = datetime.now().isoformat()
         conn.execute(
-            "UPDATE jobs SET summary=?, status=?, updated_at=?, model=? WHERE id=?",
-            (summary, "completed", now, used_model, job_id),
+            """UPDATE jobs SET summary=?, status=?, updated_at=?, model=?,
+               video_id=COALESCE(NULLIF(video_id, ''), ?) WHERE id=?""",
+            (summary, "completed", now, used_model, video_id, job_id),
         )
         conn.commit()
 
@@ -645,12 +653,12 @@ def _get_video_id(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:8]
 
 
-def _check_api_config(config: dict, force_asr: bool = False) -> str | None:
+def _check_api_config(config: dict, force_asr: bool = False, *, summary_only: bool = False) -> str | None:
     """检查 API 配置是否有效，返回 None=正常，str=错误信息
 
     说明：
     - 总结模型 API Key 必须始终配置
-    - 如果启用了 ASR 或用户强制 ASR，则 ASR API Key 也必须配置
+    - 任务需要提取时，如果启用或强制 ASR，也要检查 ASR API Key
     """
     summary_cfg = config.get("summary", {})
     summary_key = summary_cfg.get("api_key", "")
@@ -659,7 +667,7 @@ def _check_api_config(config: dict, force_asr: bool = False) -> str | None:
 
     asr_cfg = config.get("asr", {})
     asr_enabled = asr_cfg.get("enabled", False)
-    if force_asr or asr_enabled:
+    if not summary_only and (force_asr or asr_enabled):
         asr_key = asr_cfg.get("api_key", "")
         if not asr_key or "YOUR_" in asr_key:
             return "ASR 语音识别的 API Key 未配置（当前已启用 ASR 或强制使用 ASR），请在设置页填写"
@@ -805,14 +813,15 @@ def delete_job(job_id):
 @app.route("/api/jobs/<job_id>/retry", methods=["POST"])
 def retry_job(job_id):
     conn = db_conn()
-    row = conn.execute("SELECT url FROM jobs WHERE id=?", (job_id,)).fetchone()
+    row = conn.execute("SELECT url, transcript FROM jobs WHERE id=?", (job_id,)).fetchone()
     if not row:
         conn.close()
         return jsonify({"error": "任务不存在"}), 404
 
-    # 重试前检查 API 配置（至少总结模型必须可用）
+    # 有转录的任务只需要总结模型，缺转录时仍检查提取所需的配置。
     config = load_config()
-    err = _check_api_config(config)
+    has_transcript = bool((row["transcript"] or "").strip())
+    err = _check_api_config(config, summary_only=has_transcript)
     if err:
         conn.close()
         return jsonify({"error": err}), 400
