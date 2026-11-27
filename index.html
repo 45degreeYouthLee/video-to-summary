@@ -728,8 +728,6 @@ async function copySummary(){ try{ await navigator.clipboard.writeText(document.
 async function copyMarkdown(){ const job=jobs.find(j=>j.id===currentJobId); try{ await navigator.clipboard.writeText(job?.summary||''); showToast('Markdown 已复制','success'); }catch(e){ showToast('复制失败','error'); } }
 async function copyTranscript(){ try{ await navigator.clipboard.writeText(document.getElementById('transcriptText').textContent); showToast('字幕已复制','success'); }catch(e){ showToast('复制失败','error'); } }
 async function regenerate(){ const job=jobs.find(j=>j.id===currentJobId); if(!job) return; if(!useMockData){
-  const apiErr = validateApiConfig(false);
-  if(apiErr){ showToast(apiErr,'error'); return; }
   try{
     const result = await apiJson('/api/jobs/'+job.id+'/retry',{method:'POST'});
     if(result.error){ showToast(result.error,'error'); return; }
@@ -739,8 +737,6 @@ async function regenerate(){ const job=jobs.find(j=>j.id===currentJobId); if(!jo
 }
 showToast('正在重新生成总结...','info'); if(job){ job.status='summarizing'; renderDetail(job); renderJobs(); setTimeout(()=>{ job.status='completed'; job.summary='<h2>核心主旨</h2><p>这是重新生成后的总结内容。</p>'; job.updated_at=new Date().toISOString(); renderDetail(job); renderJobs(); showToast('总结已重新生成','success'); },2500); } }
 async function retryCurrentJob(){ const job=jobs.find(j=>j.id===currentJobId); if(!job) return; if(!useMockData){
-  const apiErr = validateApiConfig(false);
-  if(apiErr){ showToast(apiErr,'error'); return; }
   try{
     const result = await apiJson('/api/jobs/'+job.id+'/retry',{method:'POST'});
     if(result.error){ showToast(result.error,'error'); return; }
