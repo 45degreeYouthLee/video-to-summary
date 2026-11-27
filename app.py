@@ -42,6 +42,17 @@ CORS(app)
 
 # ===================== 全局串行任务队列 =====================
 job_queue = queue.Queue()
+# Guard queue registration and terminal writes together. Counts represent items
+# waiting to be claimed, not the currently running item.
+_queue_state_lock = threading.Lock()
+_waiting_jobs = {}
+
+
+def _enqueue_locked(item):
+    """Register an item while holding _queue_state_lock."""
+    job_queue.put(item)
+    job_id = item["args"][0]
+    _waiting_jobs[job_id] = _waiting_jobs.get(job_id, 0) + 1
 
 
 def _job_worker():
@@ -51,6 +62,13 @@ def _job_worker():
         try:
             args = item.get("args", ())
             kwargs = item.get("kwargs", {})
+            with _queue_state_lock:
+                job_id = args[0]
+                remaining = _waiting_jobs[job_id] - 1
+                if remaining:
+                    _waiting_jobs[job_id] = remaining
+                else:
+                    del _waiting_jobs[job_id]
             process_job(*args, **kwargs)
         except Exception as e:
             print(f"[队列] 任务执行异常: {e}")
@@ -400,21 +418,29 @@ def process_job(job_id: str, url: str, force_asr: bool = False, resume_from: str
 
         # 完成
         now = datetime.now().isoformat()
-        conn.execute(
-            """UPDATE jobs SET summary=?, status=?, updated_at=?, model=?,
-               video_id=COALESCE(NULLIF(video_id, ''), ?) WHERE id=?""",
-            (summary, "completed", now, used_model, video_id, job_id),
-        )
-        conn.commit()
+        with _queue_state_lock:
+            status = "pending" if _waiting_jobs.get(job_id, 0) else "completed"
+            conn.execute(
+                """UPDATE jobs SET summary=?, status=?, updated_at=?, model=?,
+                   video_id=COALESCE(NULLIF(video_id, ''), ?) WHERE id=?""",
+                (summary, status, now, used_model, video_id, job_id),
+            )
+            conn.commit()
 
     except Exception as e:
         now = datetime.now().isoformat()
         error_msg = str(e)
-        conn.execute(
-            "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
-            ("failed", error_msg, now, job_id),
-        )
-        conn.commit()
+        # Release any failed write transaction before taking the queue lock,
+        # matching the queue-lock-then-SQLite ordering used by the routes.
+        if conn.in_transaction:
+            conn.rollback()
+        with _queue_state_lock:
+            has_later = bool(_waiting_jobs.get(job_id, 0))
+            conn.execute(
+                "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
+                ("pending" if has_later else "failed", None if has_later else error_msg, now, job_id),
+            )
+            conn.commit()
     finally:
         conn.close()
 
@@ -777,16 +803,15 @@ def create_job():
     job_id = str(uuid.uuid4())[:8]
     now = datetime.now().isoformat()
 
-    conn = db_conn()
-    conn.execute(
-        "INSERT INTO jobs (id, url, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (job_id, url, "pending", now, now),
-    )
-    conn.commit()
-    conn.close()
-
-    # 加入全局串行队列
-    job_queue.put({"args": (job_id, url, force_asr), "kwargs": {}})
+    with _queue_state_lock:
+        conn = db_conn()
+        conn.execute(
+            "INSERT INTO jobs (id, url, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (job_id, url, "pending", now, now),
+        )
+        conn.commit()
+        conn.close()
+        _enqueue_locked({"args": (job_id, url, force_asr), "kwargs": {}})
 
     return jsonify({"id": job_id, "status": "pending"})
 
@@ -828,14 +853,14 @@ def retry_job(job_id):
 
     url = row["url"]
     now = datetime.now().isoformat()
-    conn.execute(
-        "UPDATE jobs SET status=?, error=NULL, updated_at=? WHERE id=?",
-        ("pending", now, job_id),
-    )
-    conn.commit()
-    conn.close()
-
-    job_queue.put({"args": (job_id, url), "kwargs": {}})
+    with _queue_state_lock:
+        conn.execute(
+            "UPDATE jobs SET status=?, error=NULL, updated_at=? WHERE id=?",
+            ("pending", now, job_id),
+        )
+        conn.commit()
+        conn.close()
+        _enqueue_locked({"args": (job_id, url), "kwargs": {}})
     return jsonify({"id": job_id, "status": "pending"})
 
 
@@ -866,24 +891,25 @@ def retry_asr(job_id):
     audio_ok = audio_path and Path(audio_path).exists() and video_id in Path(audio_path).name
     if not audio_ok:
         print(f"[API] audio_path 不可用或 mismatch: {audio_path}，降级为从头开始", flush=True)
-        conn.execute(
-            "UPDATE jobs SET status=?, error=NULL, audio_path=NULL, updated_at=? WHERE id=?",
-            ("pending", now, job_id),
-        )
-        conn.commit()
-        conn.close()
-        job_queue.put({"args": (job_id, url), "kwargs": {}})
+        with _queue_state_lock:
+            conn.execute(
+                "UPDATE jobs SET status=?, error=NULL, audio_path=NULL, updated_at=? WHERE id=?",
+                ("pending", now, job_id),
+            )
+            conn.commit()
+            conn.close()
+            _enqueue_locked({"args": (job_id, url), "kwargs": {}})
         return jsonify({"id": job_id, "status": "pending"})
 
     # 不清理旧字幕：ASR 成功后会覆盖；失败时保留旧字幕便于排查
-    conn.execute(
-        "UPDATE jobs SET status=?, error=NULL, updated_at=? WHERE id=?",
-        ("asr_recognizing", now, job_id),
-    )
-    conn.commit()
-    conn.close()
-
-    job_queue.put({"args": (job_id, url), "kwargs": {"resume_from": "asr"}})
+    with _queue_state_lock:
+        conn.execute(
+            "UPDATE jobs SET status=?, error=NULL, updated_at=? WHERE id=?",
+            ("asr_recognizing", now, job_id),
+        )
+        conn.commit()
+        conn.close()
+        _enqueue_locked({"args": (job_id, url), "kwargs": {"resume_from": "asr"}})
     return jsonify({"id": job_id, "status": "asr_recognizing"})
 
 
@@ -1277,37 +1303,38 @@ def create_jobs_batch():
     if err:
         return jsonify({"error": err}), 400
 
-    conn = db_conn()
     now = datetime.now().isoformat()
     created = []
-    try:
-        for v in videos:
-            bv = v.get("bv", "").strip()
-            if not bv:
-                continue
-            job_id = str(uuid.uuid4())[:8]
-            url = f"https://www.bilibili.com/video/{bv}"
-            conn.execute(
-                """INSERT INTO jobs
-                   (id, url, video_id, title, thumbnail, uploader, duration,
-                    status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (job_id, url, bv,
-                 v.get("title", ""), v.get("cover", ""),
-                 v.get("uploader", ""), v.get("duration"),
-                 "pending", now, now),
-            )
-            created.append({"id": job_id, "url": url, "title": v.get("title", "")})
-        conn.commit()
-    finally:
-        conn.close()
+    with _queue_state_lock:
+        conn = db_conn()
+        try:
+            for v in videos:
+                bv = v.get("bv", "").strip()
+                if not bv:
+                    continue
+                job_id = str(uuid.uuid4())[:8]
+                url = f"https://www.bilibili.com/video/{bv}"
+                conn.execute(
+                    """INSERT INTO jobs
+                       (id, url, video_id, title, thumbnail, uploader, duration,
+                        status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (job_id, url, bv,
+                     v.get("title", ""), v.get("cover", ""),
+                     v.get("uploader", ""), v.get("duration"),
+                     "pending", now, now),
+                )
+                created.append({"id": job_id, "url": url, "title": v.get("title", "")})
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 加入全局串行队列，保证顺序执行且避免并发资源冲突
+        for c in created:
+            _enqueue_locked({"args": (c["id"], c["url"], force_asr), "kwargs": {}})
 
     if not created:
         return jsonify({"error": "没有有效的视频"}), 400
-
-    # 加入全局串行队列，保证顺序执行且避免并发资源冲突
-    for c in created:
-        job_queue.put({"args": (c["id"], c["url"], force_asr), "kwargs": {}})
 
     return jsonify({"jobs": created, "total": len(created)})
 
